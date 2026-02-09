@@ -304,25 +304,28 @@ The source files in this repo map to server paths:
 
 ## Current Status
 
-**Date:** 2026-02-08
-**Status:** HEALTHY — Cleanup sprint complete, ready for multi-agent expansion
+**Date:** 2026-02-09
+**Status:** HEALTHY — Ready for multi-agent expansion (CV + FR)
 
 ### What's Done
 - Sprints 1-3 deployed: KOI-net federation working between Octo (coordinator) and GV (leaf)
-- Cleanup sprint: fixed AGE extension bug, ensure_schema columns, event confirmation flow, cross-ref upgrade logic
-- 70 entities in Octo (including 2 Practices, seeded via `seed-vault-entities.sh`)
+- Cleanup sprint complete: AGE extension bug, ensure_schema columns (phonetic_code, vault_rid, koi_rid), event confirmation e2e, cross-ref upgrade logic
+- 70 entities in Octo across 14 types, seeded via `seed-vault-entities.sh`
+- Event confirmation flow working end-to-end (event_id added to WireEvent + poll response)
 - Cross-reference resolution verified: Herring Monitoring = `same_as` (confidence 1.0)
 - Interop tests 8/8 passing, federation test passing, both agents healthy (14% RAM)
-- Architecture updated: Gulf Islands → Cowichan Valley, Front Range added as peer network
-- All changes committed and pushed to GitHub (commit `307ca15`)
+- Architecture updated: Cowichan Valley replaces Gulf Islands, Front Range added as peer network
+- Phase 5.7 planned: GitHub sensor for self-knowledge (adapt RegenAI sensor)
+- Test artifacts cleaned up (stale cross-refs + test entities removed from GV)
 
 ### What's Left
-1. **Tomorrow: Launch Cowichan Valley + Front Range agents** — create agent dirs, databases, workspace files, systemd services, configure edges, test cross-references
-2. **Phase 0.5: BKC CoIP vault audit** — blocked on access from Andrea Farias / Vincent Arena
-3. **Phase 5: Cascadia coordinator** — after CV is running, proves holon pattern
+1. **Launch Cowichan Valley + Front Range agents** — create agent dirs, databases, workspace files, systemd services, configure edges, test cross-references (Darren's friends will help seed practices)
+2. **Phase 5.7: GitHub sensor** — adapt `RegenAI/koi-sensors/sensors/github/` to index `DarrenZal/Octo` into Octo's KOI API for self-knowledge
+3. **Phase 0.5: BKC CoIP vault audit** — blocked on access from Andrea Farias / Vincent Arena
+4. **Phase 5: Cascadia coordinator** — after CV is running, proves holon pattern
 
 ### Open Questions
-- Front Range: connect to Octo directly for now (since Cascadia doesn't exist yet) or wait for Cascadia?
+- Front Range: connect to Octo directly for now (since Cascadia doesn't exist yet) or wait?
 - What practices will CV and FR friends seed? (they should prepare 2-3 each)
 
 ### Adding a New Agent (Quick Reference)
@@ -353,4 +356,4 @@ curl -s http://127.0.0.1:8354/health
 | Session ID | Date | Scope | Key Work |
 |------------|------|-------|----------|
 | `eca2a0ec` | 2026-02-08 | Holonic infra | Strategy docs, implementation plan, SSH setup, hyperlinks |
-| `7aead4bb` | 2026-02-08 | Cleanup sprint | Fix deployment bugs, seed 70 entities, event_id confirm flow, architecture update (CV + FR) |
+| `7aead4bb` | 2026-02-08 | Cleanup sprint | Fix deployment bugs, seed 70 entities, event_id confirm flow, architecture update (CV + FR), GitHub sensor plan (Phase 5.7) |
