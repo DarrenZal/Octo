@@ -1202,6 +1202,79 @@ This is the initial version — full pattern mining is Phase 6.
 
 ---
 
+## Phase 5.7: GitHub Sensor (Self-Knowledge)
+
+**Goal:** Give Octo knowledge of its own architecture by ingesting its GitHub repository through a KOI sensor. This enables Octo to answer questions about its own codebase, implementation plan, and ontology.
+
+**Why:** Currently Octo has 70 entities about bioregional knowledge but zero self-knowledge. It can explain herring monitoring but not how its own event queue works. A GitHub sensor that indexes `DarrenZal/Octo` into the KOI API creates a self-referential knowledge loop — the agent understands the system it runs on.
+
+**Reference implementation:** `~/projects/RegenAI/koi-sensors/sensors/github/github_sensor.py` — an existing GitHub sensor that indexes Regen Network repos into the RegenAI KOI coordinator. Adapt this to target Octo's KOI API.
+
+### Setup
+
+**New file:** `koi-processor/sensors/github_sensor.py` (adapted from RegenAI)
+**Config:** `koi-processor/config/github_sensor.yaml`
+
+```yaml
+sensor:
+  name: octo-github-sensor
+  type: github
+  coordinator_url: "http://127.0.0.1:8351"  # Octo KOI API
+
+repositories:
+  - name: Octo
+    url: https://github.com/DarrenZal/Octo
+    branch: main
+    paths:
+      - "docs/"
+      - "koi-processor/api/"
+      - "koi-processor/migrations/"
+      - "workspace/"
+      - "ontology/"
+      - "README.md"
+      - "CLAUDE.md"
+    priority: high
+    check_interval: 3600  # 1 hour
+
+  - name: koi-net
+    url: https://github.com/BlockScience/koi-net
+    branch: main
+    paths: ["src/", "docs/", "README.md"]
+    priority: medium
+    check_interval: 86400  # Daily
+
+  - name: personal-koi-mcp
+    url: https://github.com/DarrenZal/personal-koi-mcp
+    branch: main
+    paths: ["src/", "README.md"]
+    priority: medium
+    check_interval: 86400
+```
+
+### What Gets Indexed
+
+The sensor creates entities of type `Concept` (for architectural components) and documents (for markdown files), with relationships:
+- Implementation plan sections → `about` → entity types they describe
+- API files → `implements` → protocol concepts
+- Ontology files → `documents` → the BKC ontology itself
+
+### Integration
+
+- Source tag: `source: "github-sensor"` (distinct from `personal-vault`)
+- Entity types: primarily `Concept` and `Project` (not Practice/Pattern — those come from bioregional knowledge)
+- Cross-references: entities from GitHub docs that mention bioregional concepts (e.g., "Herring Monitoring" in README.md) create links to existing vault entities
+
+### Tasks
+
+- [ ] Adapt `github_sensor.py` from RegenAI to work with Octo's KOI API (different endpoint format)
+- [ ] Create `github_sensor.yaml` config pointing at Octo + BlockScience repos
+- [ ] Add systemd service for the sensor
+- [ ] Test: sensor indexes Octo README → entity created with source `github-sensor`
+- [ ] Verify: cross-references between GitHub-sourced entities and vault entities resolve correctly
+- [ ] Optional: add sensor for each leaf node's repo (CV, FR) so each agent knows its own code
+
+---
+
 ## Phase 6: Cross-Scale Pattern Mining
 
 > **Status: Design TBD.** This phase requires a separate design spike before implementation. The outline below captures intent and open questions, but is not yet a buildable spec. Plan a dedicated design session after Phase 5 proves the holon pattern works.
@@ -1330,12 +1403,14 @@ watchdog>=4.0         # File system monitoring (markdown sensor)
 | Existing entities have KOI RIDs | 4.0 | Python backfill script completes, all entity_registry rows have koi_rid values |
 | GV → Octo federation | 4 | GV practice appears as cross-reference in Octo |
 | Resource checkpoint passes | Gate | Sustained RAM < 6GB, PG connections < 30 |
-| Second leaf node operational | 4.5 | Both GV and GI events arrive at Octo |
+| Second leaf node operational | 4.5 | Both GV and CV events arrive at Octo |
 | Horizontal aggregation proven | 4.5 | Octo holds cross-references from 2 leaf nodes |
 | 3-hop event propagation | 5 | GV → Octo → Cascadia with holon boundary |
 | Upstream forwarding transforms content | 5.2 | Cascadia sees Octo as source, GV references resolved, access_level enforced |
 | Cascadia sees aggregated network | 5 | Cascadia receives events from both sub-bioregions via Octo |
-| Error handling for network failures | 5.5 | Exponential backoff, signature failure logging, stale RID handling |
+| Front Range peers with Cascadia | 5.5 | Practices federate between independent bioregional networks |
+| Error handling for network failures | 5.6 | Exponential backoff, signature failure logging, stale RID handling |
+| GitHub sensor indexes Octo repo | 5.7 | Entities with `source: github-sensor` exist, cross-ref to vault entities |
 | Pattern mining design spike complete | 6 | Design doc answers all 6 open questions |
 | Pattern emerges from practices | 6 | Cascadia creates Pattern from clustered practices |
 
