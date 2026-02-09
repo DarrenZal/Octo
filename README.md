@@ -226,7 +226,7 @@ bash scripts/test-federation.sh        # End-to-end federation test
 
 ## Context
 
-Octo is the agent of the [BKC CoIP](https://www.r3-0.org/bkc-coip/) (Bioregional Knowledge Commons Community of Inquiry & Practice) — a collaborative initiative focused on building shared knowledge infrastructure for bioregional organizing worldwide.
+Octo is an agent that aims to help the [BKC CoIP](https://www.r3-0.org/bkc-coip/) (Bioregional Knowledge Commons Community of Inquiry & Practice) — a collaborative initiative focused on building shared knowledge infrastructure for bioregional organizing worldwide.
 
 The ontology is grounded in:
 - **Bollier & Helfrich** — *Free, Fair & Alive* (pattern mining from commoning practices)
