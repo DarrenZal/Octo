@@ -14,6 +14,10 @@ Octo is also a **KOI-net federation coordinator** — it aggregates knowledge fr
 - **Vault Integration**: Bidirectional linking between an Obsidian-style vault and a PostgreSQL knowledge graph
 - **KOI-net Federation**: Authenticated event-driven protocol for cross-bioregional knowledge sharing with ECDSA-signed envelopes, background polling, and cross-reference resolution
 
+## Website
+
+The [Salish Sea Knowledge Garden](https://github.com/DarrenZal/salish-sea-garden) is Octo's public-facing knowledge site — a browsable, searchable view of the knowledge graph with an interactive D3.js visualization and a chatbot for asking Octo questions directly.
+
 ## Architecture
 
 ### Holonic Network
