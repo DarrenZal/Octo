@@ -230,6 +230,90 @@ const bioregionalKoiPlugin = {
       },
       { names: ["vault_list_notes"] },
     );
+
+    // preview_url — fetch and preview a URL for evaluation
+    api.registerTool(
+      {
+        name: "preview_url",
+        description:
+          "Fetch and preview a URL someone shared. Returns title, content summary, detected entities, and safety check. Use when someone shares a URL. Does NOT ingest — just previews so you can evaluate relevance.",
+        parameters: {
+          type: "object",
+          properties: {
+            url: { type: "string", description: "The URL to preview" },
+            submitted_by: { type: "string", description: "Username of the person who shared the URL" },
+            submitted_via: { type: "string", description: "Channel: telegram, discord, or api" },
+          },
+          required: ["url"],
+        },
+        async execute(_id: string, params: Record<string, unknown>) {
+          const url = params.url as string;
+          const submitted_by = params.submitted_by as string | undefined;
+          const submitted_via = (params.submitted_via as string) || "telegram";
+          const data = await koiRequest("/web/preview", "POST", {
+            url,
+            submitted_by,
+            submitted_via,
+          });
+          return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+        },
+      },
+      { names: ["preview_url"] },
+    );
+
+    // ingest_url — ingest a previously previewed URL
+    api.registerTool(
+      {
+        name: "ingest_url",
+        description:
+          "Ingest a previously previewed URL into the knowledge graph. Call AFTER preview_url and your evaluation. Pass the entities and relationships you identified from the preview.",
+        parameters: {
+          type: "object",
+          properties: {
+            url: { type: "string", description: "The URL to ingest (must have been previewed first)" },
+            entities: {
+              type: "array",
+              description: "Entities to resolve and link to this URL",
+              items: {
+                type: "object",
+                properties: {
+                  name: { type: "string" },
+                  type: { type: "string", description: "Person, Organization, Project, Concept, Location, Bioregion, Practice, etc." },
+                  context: { type: "string", description: "Brief context for how this entity relates" },
+                },
+                required: ["name", "type"],
+              },
+            },
+            relationships: {
+              type: "array",
+              description: "Relationships between entities",
+              items: {
+                type: "object",
+                properties: {
+                  subject: { type: "string" },
+                  predicate: { type: "string" },
+                  object: { type: "string" },
+                },
+                required: ["subject", "predicate", "object"],
+              },
+            },
+          },
+          required: ["url"],
+        },
+        async execute(_id: string, params: Record<string, unknown>) {
+          const url = params.url as string;
+          const entities = (params.entities as any[]) || [];
+          const relationships = (params.relationships as any[]) || [];
+          const data = await koiRequest("/web/ingest", "POST", {
+            url,
+            entities,
+            relationships,
+          });
+          return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+        },
+      },
+      { names: ["ingest_url"] },
+    );
   },
 };
 

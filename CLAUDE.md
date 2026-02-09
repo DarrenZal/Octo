@@ -41,6 +41,7 @@ Private keys stored at `/root/koi-state/{node_name}_private_key.pem`.
 │   │   ├── personal_ingest_api.py   # Main API (FastAPI/uvicorn)
 │   │   ├── entity_schema.py         # 15 entity types, resolution config
 │   │   ├── vault_parser.py          # YAML→predicate mapping (27 predicates)
+│   │   ├── web_fetcher.py           # URL fetch + Playwright + content extraction
 │   │   ├── koi_net_router.py        # KOI-net protocol endpoints (8 endpoints)
 │   │   ├── koi_envelope.py          # ECDSA P-256 signed envelopes
 │   │   ├── koi_poller.py            # Background federation poller
@@ -54,7 +55,8 @@ Private keys stored at `/root/koi-state/{node_name}_private_key.pem`.
 │   │   ├── 039_koi_net_events.sql   # Event queue, edges, nodes tables
 │   │   ├── 039b_ontology_mappings.sql # Source schemas + ontology mappings
 │   │   ├── 040_entity_koi_rids.sql  # KOI RID column on entity_registry
-│   │   └── 041_cross_references.sql # Federation cross-references
+│   │   ├── 041_cross_references.sql # Federation cross-references
+│   │   └── 042_web_submissions.sql  # URL submission tracking
 │   ├── scripts/
 │   │   └── backfill_koi_rids.py     # One-time RID backfill
 │   ├── tests/
@@ -105,7 +107,8 @@ Private keys stored at `/root/koi-state/{node_name}_private_key.pem`.
 │           ├── People/
 │           ├── Organizations/
 │           ├── Projects/
-│           └── Concepts/
+│           ├── Concepts/
+│           └── Sources/             # Ingested web sources
 ├── octo-quartz/                # Quartz static site generator
 │   ├── quartz.config.ts          # Site config (title, theme, plugins)
 │   ├── content -> vault/         # Symlink to vault
@@ -177,6 +180,12 @@ scp koi-processor/api/*.py root@45.132.245.30:~/koi-processor/api/
 ssh root@45.132.245.30 "bash ~/scripts/manage-agents.sh restart"
 ```
 
+### Deploy updated plugin + restart OpenClaw
+```bash
+scp plugins/bioregional-koi/index.ts root@45.132.245.30:~/bioregional-koi/index.ts
+ssh root@45.132.245.30 "openclaw gateway restart"
+```
+
 ### Run federation test
 ```bash
 ssh root@45.132.245.30 "bash ~/scripts/test-federation.sh"
@@ -200,6 +209,11 @@ ssh root@45.132.245.30 "docker exec regen-koi-postgres psql -U postgres -d octo_
 ### Resolve an entity via API
 ```bash
 ssh root@45.132.245.30 'curl -s -X POST http://127.0.0.1:8351/entity/resolve -H "Content-Type: application/json" -d "{\"label\": \"Herring Monitoring\", \"type_hint\": \"Practice\"}"'
+```
+
+### Test web URL preview
+```bash
+ssh root@45.132.245.30 'curl -s -X POST http://127.0.0.1:8351/web/preview -H "Content-Type: application/json" -d "{\"url\": \"https://example.com\"}" | python3 -m json.tool'
 ```
 
 ### View OpenClaw logs
@@ -230,6 +244,7 @@ All databases share one PostgreSQL container (`regen-koi-postgres`) with pgvecto
 - `allowed_predicates` — Valid predicate definitions (27 BKC predicates)
 - `pending_relationships` — Unresolved relationship targets
 - `document_entity_links` — Document↔entity mention tracking
+- `web_submissions` — URL submission lifecycle (preview → evaluate → ingest)
 
 ### Federation tables (KOI-net, per database)
 

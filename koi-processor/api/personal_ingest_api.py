@@ -46,6 +46,14 @@ from api.vault_parser import (
     SYMMETRIC_PREDICATES,
 )
 
+# Import web fetcher
+from api.web_fetcher import (
+    fetch_and_preview,
+    check_rate_limit,
+    URLValidationError,
+    generate_web_rid,
+)
+
 # Import schema loader
 from api.entity_schema import (
     get_entity_schemas,
@@ -1247,6 +1255,43 @@ async def ensure_schema(conn: asyncpg.Connection):
         """)
     except Exception:
         pass  # May fail if pg_trgm extension not available
+
+    # ==========================================================================
+    # Web Submissions Table (URL ingestion pipeline)
+    # ==========================================================================
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS web_submissions (
+            id SERIAL PRIMARY KEY,
+            url TEXT NOT NULL,
+            rid TEXT NOT NULL,
+            domain TEXT NOT NULL,
+            submitted_by TEXT,
+            submitted_via TEXT DEFAULT 'telegram',
+            submission_message TEXT,
+            status VARCHAR(20) DEFAULT 'pending',
+            relevance_score FLOAT,
+            relevance_reasoning TEXT,
+            bioregional_tags TEXT[],
+            title TEXT,
+            description TEXT,
+            content_hash TEXT,
+            word_count INT,
+            matching_entities JSONB DEFAULT '[]'::jsonb,
+            ingested_entities JSONB DEFAULT '[]'::jsonb,
+            vault_note_path TEXT,
+            fetched_at TIMESTAMPTZ,
+            evaluated_at TIMESTAMPTZ,
+            ingested_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            CONSTRAINT valid_web_status CHECK (
+                status IN ('pending', 'previewed', 'evaluated', 'ingested', 'rejected', 'error')
+            )
+        )
+    """)
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_web_submissions_created_at ON web_submissions(created_at)")
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_web_submissions_user_created ON web_submissions(submitted_by, created_at)")
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_web_submissions_url ON web_submissions(url)")
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_web_submissions_status ON web_submissions(status)")
 
     logger.info("Schema verified/created (including relationship tables)")
 
@@ -3479,6 +3524,368 @@ async def query_knowledge_base(request: QueryRequest):
         "query": query_text,
         "search_type": search_result.get("search_type", "semantic")
     }
+
+
+# =============================================================================
+# Web URL Submission Pipeline (/web/*)
+# =============================================================================
+
+class WebPreviewRequest(BaseModel):
+    """Request to preview a URL"""
+    url: str
+    submitted_by: Optional[str] = None
+    submitted_via: str = "telegram"
+    submission_message: Optional[str] = None
+
+
+class WebEvaluateRequest(BaseModel):
+    """Store Octo's relevance assessment for a previewed URL"""
+    url: str
+    relevance_score: float = Field(ge=0.0, le=1.0)
+    relevance_reasoning: str
+    bioregional_tags: List[str] = []
+    decision: str = "pending"  # ingest, reject, pending
+
+
+class WebIngestRequest(BaseModel):
+    """Ingest a previewed+evaluated URL into the knowledge graph"""
+    url: str
+    entities: List[ExtractedEntity] = []
+    relationships: List[ExtractedRelationship] = []
+    vault_folder: str = "Sources"
+
+
+@app.post("/web/preview")
+async def web_preview(request: WebPreviewRequest):
+    """Fetch a URL, extract content, scan for known entities.
+
+    Does NOT ingest — just returns a preview for the agent to evaluate.
+    """
+    if not db_pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    # Rate limit check
+    rate_error = await check_rate_limit(db_pool, request.submitted_by)
+    if rate_error:
+        raise HTTPException(status_code=429, detail=rate_error)
+
+    # Check if URL was already submitted
+    async with db_pool.acquire() as conn:
+        existing = await conn.fetchrow(
+            "SELECT id, status, title, rid FROM web_submissions WHERE url = $1",
+            request.url,
+        )
+        if existing and existing["status"] in ("ingested",):
+            return {
+                "already_ingested": True,
+                "submission_id": existing["id"],
+                "title": existing["title"],
+                "rid": existing["rid"],
+                "message": "This URL has already been ingested into the knowledge graph.",
+            }
+
+    # Validate and fetch
+    try:
+        preview = await fetch_and_preview(request.url, db_pool)
+    except URLValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if preview.fetch_error:
+        # Store the failed attempt
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO web_submissions (url, rid, domain, submitted_by, submitted_via,
+                    submission_message, status, fetched_at)
+                VALUES ($1, $2, $3, $4, $5, $6, 'error', NOW())
+                ON CONFLICT DO NOTHING
+            """, request.url, preview.rid, preview.domain,
+                request.submitted_by, request.submitted_via, request.submission_message)
+        raise HTTPException(status_code=422, detail=preview.fetch_error)
+
+    # Store the preview
+    import json as json_module
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO web_submissions (
+                url, rid, domain, submitted_by, submitted_via, submission_message,
+                status, title, description, content_hash, word_count,
+                matching_entities, fetched_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, 'previewed', $7, $8, $9, $10, $11::jsonb, NOW())
+            ON CONFLICT DO NOTHING
+        """, request.url, preview.rid, preview.domain,
+            request.submitted_by, request.submitted_via, request.submission_message,
+            preview.title, preview.description, preview.content_hash, preview.word_count,
+            json_module.dumps([e.to_dict() if hasattr(e, 'to_dict') else {
+                "name": e.name, "uri": e.uri, "type": e.entity_type, "context": e.match_context
+            } for e in preview.matching_entities]))
+
+    logger.info(f"Web preview: {request.url} -> {preview.title} ({preview.word_count} words, "
+                f"{len(preview.matching_entities)} entities)")
+
+    return preview.to_dict()
+
+
+@app.post("/web/evaluate")
+async def web_evaluate(request: WebEvaluateRequest):
+    """Store the agent's relevance evaluation for a previewed URL.
+
+    Called by Octo after previewing a URL and deciding whether to ingest.
+    """
+    if not db_pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    async with db_pool.acquire() as conn:
+        result = await conn.execute("""
+            UPDATE web_submissions
+            SET relevance_score = $2,
+                relevance_reasoning = $3,
+                bioregional_tags = $4,
+                status = CASE WHEN $5 = 'reject' THEN 'rejected' ELSE 'evaluated' END,
+                evaluated_at = NOW()
+            WHERE url = $1 AND status = 'previewed'
+        """, request.url, request.relevance_score, request.relevance_reasoning,
+            request.bioregional_tags, request.decision)
+
+        if result == "UPDATE 0":
+            raise HTTPException(
+                status_code=404,
+                detail="URL not found in previewed state. Preview the URL first."
+            )
+
+    status = "rejected" if request.decision == "reject" else "evaluated"
+    logger.info(f"Web evaluate: {request.url} -> score={request.relevance_score}, "
+                f"status={status}, tags={request.bioregional_tags}")
+
+    return {
+        "url": request.url,
+        "status": status,
+        "relevance_score": request.relevance_score,
+        "relevance_reasoning": request.relevance_reasoning,
+        "bioregional_tags": request.bioregional_tags,
+    }
+
+
+@app.post("/web/ingest")
+async def web_ingest(request: WebIngestRequest):
+    """Ingest a previewed+evaluated URL into the knowledge graph.
+
+    1. Resolve entities via existing 3-tier resolution
+    2. Create entity relationships
+    3. Generate vault note in Sources/ folder
+    4. Link document to entities via document_entity_links
+    5. Emit KOI-net event if federation enabled
+    """
+    if not db_pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    async with db_pool.acquire() as conn:
+        # Get the submission record
+        submission = await conn.fetchrow(
+            "SELECT * FROM web_submissions WHERE url = $1",
+            request.url,
+        )
+        if not submission:
+            raise HTTPException(status_code=404, detail="URL not found. Preview it first.")
+        if submission["status"] == "ingested":
+            return {
+                "already_ingested": True,
+                "rid": submission["rid"],
+                "vault_note_path": submission["vault_note_path"],
+                "message": "This URL has already been ingested.",
+            }
+        if submission["status"] not in ("previewed", "evaluated"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"URL is in '{submission['status']}' state, not ready for ingestion."
+            )
+
+    rid = submission["rid"]
+    document_rid = f"web:{rid}"
+
+    # Resolve entities
+    canonical_entities = []
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            for entity in request.entities:
+                try:
+                    canonical, is_new = await resolve_entity(conn, entity, None)
+                    canonical_entities.append(canonical)
+
+                    if is_new:
+                        await store_new_entity(conn, entity, canonical, document_rid)
+
+                    # Link entity to this web document
+                    await conn.execute("""
+                        INSERT INTO document_entity_links (document_rid, entity_uri, context)
+                        VALUES ($1, $2, $3)
+                        ON CONFLICT (document_rid, entity_uri)
+                        DO UPDATE SET mention_count = document_entity_links.mention_count + 1
+                    """, document_rid, canonical.uri, entity.context)
+
+                except Exception as e:
+                    logger.warning(f"Failed to resolve entity {entity.name}: {e}")
+
+            # Store relationships
+            for rel in request.relationships:
+                try:
+                    # Find URIs for subject and object
+                    subj_uri = None
+                    obj_uri = None
+                    for ce in canonical_entities:
+                        if ce.name.lower() == rel.subject.lower():
+                            subj_uri = ce.uri
+                        if ce.name.lower() == rel.object.lower():
+                            obj_uri = ce.uri
+
+                    if subj_uri and obj_uri:
+                        exists = await check_relationship_exists(
+                            conn, subj_uri, rel.predicate, obj_uri
+                        )
+                        if not exists:
+                            await conn.execute("""
+                                INSERT INTO entity_relationships
+                                    (subject_uri, predicate, object_uri, confidence, source, source_rid)
+                                VALUES ($1, $2, $3, $4, 'web', $5)
+                                ON CONFLICT (subject_uri, predicate, object_uri) DO NOTHING
+                            """, subj_uri, rel.predicate, obj_uri, rel.confidence, document_rid)
+                except Exception as e:
+                    logger.warning(f"Failed to store relationship: {e}")
+
+    # Generate vault note
+    vault_path = _generate_source_vault_note(
+        submission, canonical_entities, request.vault_folder
+    )
+
+    # Update submission record
+    import json as json_module
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            UPDATE web_submissions
+            SET status = 'ingested',
+                ingested_at = NOW(),
+                vault_note_path = $2,
+                ingested_entities = $3::jsonb
+            WHERE url = $1
+        """, request.url, vault_path,
+            json_module.dumps([{"name": ce.name, "uri": ce.uri, "type": ce.type,
+                                "is_new": ce.is_new} for ce in canonical_entities]))
+
+    # Emit KOI-net event
+    if KOI_NET_ENABLED:
+        try:
+            from api.koi_net_router import _event_queue
+            if _event_queue:
+                await _event_queue.add(
+                    rid=rid,
+                    event_type="NEW",
+                    contents={
+                        "url": request.url,
+                        "@type": "bkc:WebSource",
+                        "title": submission["title"],
+                        "domain": submission["domain"],
+                        "source": "web",
+                    },
+                )
+                logger.info(f"KOI-net event emitted: NEW {rid}")
+        except Exception as e:
+            logger.warning(f"Failed to emit KOI-net event: {e}")
+
+    logger.info(f"Web ingest: {request.url} -> {len(canonical_entities)} entities, "
+                f"vault={vault_path}")
+
+    return {
+        "success": True,
+        "url": request.url,
+        "rid": rid,
+        "document_rid": document_rid,
+        "vault_note_path": vault_path,
+        "entities_resolved": len(canonical_entities),
+        "entities": [
+            {"name": ce.name, "uri": ce.uri, "type": ce.type, "is_new": ce.is_new}
+            for ce in canonical_entities
+        ],
+    }
+
+
+def _generate_source_vault_note(
+    submission, canonical_entities, vault_folder: str = "Sources"
+) -> str:
+    """Generate a vault note for an ingested web source.
+
+    Returns the relative vault path (e.g., 'Sources/salishsea_io.md').
+    """
+    import os as os_module
+
+    vault_base = os.getenv("VAULT_PATH", "/root/.openclaw/workspace/vault")
+    domain = submission["domain"]
+    title = submission["title"] or domain
+
+    # Create safe filename from title
+    safe_name = re.sub(r"[^\w\s-]", "", title)[:60].strip()
+    safe_name = re.sub(r"\s+", " ", safe_name).strip()
+    if not safe_name:
+        safe_name = domain.replace(".", "_")
+
+    rel_path = f"{vault_folder}/{safe_name}.md"
+    full_path = os_module.path.join(vault_base, rel_path)
+
+    # Ensure directory exists
+    os_module.makedirs(os_module.path.dirname(full_path), exist_ok=True)
+
+    # Build frontmatter
+    entity_links = []
+    for ce in canonical_entities:
+        type_folder = ce.type + "s" if not ce.type.endswith("s") else ce.type
+        entity_links.append(f"[[{type_folder}/{ce.name}]]")
+
+    tags = list(submission["bioregional_tags"] or [])
+
+    lines = [
+        "---",
+        f'"@type": WebSource',
+        f"name: \"{title}\"",
+        f"url: \"{submission['url']}\"",
+        f"domain: \"{domain}\"",
+        f"rid: \"{submission['rid']}\"",
+    ]
+    if submission.get("relevance_score") is not None:
+        lines.append(f"relevanceScore: {submission['relevance_score']}")
+    if tags:
+        lines.append(f"tags: [{', '.join(tags)}]")
+    if submission.get("submitted_by"):
+        lines.append(f"submittedBy: \"{submission['submitted_by']}\"")
+    lines.append(f"ingestedAt: \"{datetime.now(timezone.utc).isoformat()}\"")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# {title}")
+    lines.append("")
+    lines.append(f"**URL:** {submission['url']}")
+    lines.append(f"**Domain:** {domain}")
+    if submission.get("description"):
+        lines.append(f"**Description:** {submission['description']}")
+    lines.append(f"**Word Count:** {submission.get('word_count', 0)}")
+    lines.append("")
+
+    if submission.get("relevance_reasoning"):
+        lines.append("## Relevance Assessment")
+        lines.append("")
+        lines.append(submission["relevance_reasoning"])
+        lines.append("")
+
+    if entity_links:
+        lines.append("## Connected Entities")
+        lines.append("")
+        for link in entity_links:
+            lines.append(f"- {link}")
+        lines.append("")
+
+    content = "\n".join(lines)
+
+    with open(full_path, "w") as f:
+        f.write(content)
+
+    logger.info(f"Generated vault note: {rel_path}")
+    return rel_path
 
 
 if __name__ == "__main__":

@@ -11,6 +11,10 @@ asyncpg==0.30.0
 
 # HTTP
 httpx==0.25.2
+aiohttp>=3.9.0
+
+# HTML parsing (web fetcher)
+beautifulsoup4>=4.12.0
 
 # String matching
 rapidfuzz>=3.0.0

@@ -11,6 +11,7 @@ Octo is also a **KOI-net federation coordinator** — it aggregates knowledge fr
 - **Knowledge Commoning**: Tracks bioregional practices, identifies trans-bioregional patterns, and documents case studies using a formal ontology grounded in the work of David Bollier & Silke Helfrich
 - **Discourse Graph**: Manages questions, claims, and evidence with typed relationships (supports, opposes, informs) — enabling progressive formalization of bioregional knowledge
 - **Entity Resolution**: Multi-tier entity resolution (exact → fuzzy → semantic → create) with OpenAI embeddings and pgvector
+- **Web Content Curation**: Users share URLs via Telegram/Discord, Octo previews (with Playwright for JS-rendered sites), evaluates bioregional relevance, and ingests into the knowledge graph with entity linking
 - **Vault Integration**: Bidirectional linking between an Obsidian-style vault and a PostgreSQL knowledge graph
 - **KOI-net Federation**: Authenticated event-driven protocol for cross-bioregional knowledge sharing with ECDSA-signed envelopes, background polling, and cross-reference resolution
 
@@ -47,12 +48,14 @@ Each node runs the same KOI API codebase with its own database, vault, and ident
 ├──────────────────────────────────────────────────┤
 │  bioregional-koi plugin                           │
 │  ├─ Entity resolution (resolve, register, search) │
+│  ├─ Web content curation (preview_url, ingest_url)│
 │  ├─ Vault read/write                              │
 │  └─ Relationship sync                             │
 ├──────────────────────────────────────────────────┤
 │  KOI Processor API (uvicorn)                      │
 │  ├─ entity_schema.py  (15 entity types)           │
 │  ├─ vault_parser.py   (27 predicates, aliases)    │
+│  ├─ web_fetcher.py    (URL fetch + Playwright)    │
 │  ├─ personal_ingest_api.py                        │
 │  └─ KOI-net protocol (feature flag)               │
 │     ├─ koi_net_router.py   (8 protocol endpoints) │
@@ -127,6 +130,7 @@ See [ontology/bkc-ontology.jsonld](ontology/bkc-ontology.jsonld) for the formal 
 │   │   ├── personal_ingest_api.py   # Main API (FastAPI/uvicorn)
 │   │   ├── entity_schema.py         # 15 entity types, resolution config
 │   │   ├── vault_parser.py          # YAML→predicate mapping
+│   │   ├── web_fetcher.py           # URL fetch, Playwright, content extraction
 │   │   ├── koi_net_router.py        # KOI-net protocol endpoints
 │   │   ├── koi_envelope.py          # ECDSA P-256 signed envelopes
 │   │   ├── koi_poller.py            # Background federation poller
@@ -140,7 +144,8 @@ See [ontology/bkc-ontology.jsonld](ontology/bkc-ontology.jsonld) for the formal 
 │   │   ├── 039_koi_net_events.sql   # Event queue, edges, nodes tables
 │   │   ├── 039b_ontology_mappings.sql # Source schemas + mappings
 │   │   ├── 040_entity_koi_rids.sql  # KOI RID column on entity_registry
-│   │   └── 041_cross_references.sql # Cross-references for federation
+│   │   ├── 041_cross_references.sql # Cross-references for federation
+│   │   └── 042_web_submissions.sql  # URL submission tracking
 │   ├── scripts/
 │   │   └── backfill_koi_rids.py     # One-time RID backfill
 │   ├── tests/
