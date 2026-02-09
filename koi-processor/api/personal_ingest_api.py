@@ -83,6 +83,7 @@ KOI_MODE = os.getenv('KOI_MODE', 'personal')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '')
 EMBEDDING_MODEL = os.getenv('EMBEDDING_MODEL', 'text-embedding-ada-002')
 ENABLE_SEMANTIC_MATCHING = os.getenv('ENABLE_SEMANTIC_MATCHING', 'true').lower() == 'true'
+KOI_NET_ENABLED = os.getenv('KOI_NET_ENABLED', 'false').lower() == 'true'
 
 # DEPRECATED: These are now loaded from vault schemas via entity_schema.py
 # Kept as fallback comments for reference
@@ -938,6 +939,16 @@ async def startup():
         # Ensure schema exists
         async with db_pool.acquire() as conn:
             await ensure_schema(conn)
+
+        # Mount KOI-net protocol router if enabled
+        if KOI_NET_ENABLED:
+            try:
+                from api.koi_net_router import koi_net_router, setup_koi_net
+                app.include_router(koi_net_router, prefix="/koi-net")
+                await setup_koi_net(db_pool)
+                logger.info("KOI-net protocol endpoints mounted at /koi-net/")
+            except Exception as e:
+                logger.error(f"Failed to initialize KOI-net: {e}")
 
         # Initialize OpenAI client if API key is available
         openai_available = check_openai_availability()

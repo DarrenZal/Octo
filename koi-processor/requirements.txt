@@ -20,6 +20,10 @@ metaphone>=0.6
 python-dotenv>=1.0.0
 pyyaml==6.0.1
 
+# KOI-net Protocol (Phase 3)
+rid-lib>=3.2.8
+cryptography>=42.0
+
 # Logging
 colorlog==6.8.0
 loguru==0.7.2

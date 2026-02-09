@@ -1,0 +1,16 @@
+[Unit]
+Description=Greater Victoria KOI API
+After=network.target docker.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/koi-processor
+Environment=PATH=/root/koi-processor/venv/bin:/usr/bin
+EnvironmentFile=/root/gv-agent/config/gv.env
+ExecStart=/root/koi-processor/venv/bin/uvicorn api.personal_ingest_api:app --host 127.0.0.1 --port 8352
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
