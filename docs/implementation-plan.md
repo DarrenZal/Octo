@@ -25,7 +25,7 @@
 
 ### Infrastructure (Single VPS)
 
-All agents run on the existing VPS (`45.132.245.30`, 4 vCPU / 8GB RAM / 247GB disk), sharing the PostgreSQL container with separate databases:
+All agents run on the existing VPS (`<SERVER_IP>`, 4 vCPU / 8GB RAM / 247GB disk), sharing the PostgreSQL container with separate databases:
 
 | Agent | Database | KOI API Port | Vault Path | Status |
 |-------|----------|-------------|------------|--------|
@@ -332,7 +332,7 @@ done
 
 **Tasks:**
 - [ ] Create `docker/create-additional-dbs.sh`
-- [ ] Run on server: `scp docker/create-additional-dbs.sh root@45.132.245.30:~/koi-stack/ && ssh root@45.132.245.30 "bash ~/koi-stack/create-additional-dbs.sh"`
+- [ ] Run on server: `scp docker/create-additional-dbs.sh root@<SERVER_IP>:~/koi-stack/ && ssh root@<SERVER_IP> "bash ~/koi-stack/create-additional-dbs.sh"`
 - [ ] Verify databases exist: `docker exec regen-koi-postgres psql -U postgres -c "\l" | grep koi`
 - [ ] Verify extensions loaded: `docker exec regen-koi-postgres psql -U postgres -d gv_koi -c "\dx"`
 - [ ] Verify predicates populated: `docker exec regen-koi-postgres psql -U postgres -d gv_koi -c "SELECT count(*) FROM allowed_predicates;"`

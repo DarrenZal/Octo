@@ -24,7 +24,7 @@ Three KOI deployments exist, each operating at a different scale and purpose. To
 
 ### Octo — Bioregional Knowledge for the Salish Sea
 
-Octo is an OpenClaw agent deployed on a VPS at `45.132.245.30`, serving as the AI agent for the BKC CoIP (Bioregional Knowledge Commons Community of Inquiry & Practice). It combines:
+Octo is an OpenClaw agent deployed on a VPS at `<SERVER_IP>`, serving as the AI agent for the BKC CoIP (Bioregional Knowledge Commons Community of Inquiry & Practice). It combines:
 
 - **OpenClaw runtime** — multi-platform chat agent (Telegram + Discord) with plugin system
 - **KOI backend** — FastAPI service (port 8351) with four-tier entity resolution:

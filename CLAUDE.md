@@ -2,14 +2,14 @@
 
 ## Overview
 
-Octo is a bioregional knowledge commoning agent built on OpenClaw, deployed on a VPS at `45.132.245.30`. It runs a KOI (Knowledge Organization Infrastructure) backend with a PostgreSQL knowledge graph and serves as the AI agent for the BKC CoIP (Bioregional Knowledge Commons Community of Inquiry & Practice).
+Octo is a bioregional knowledge commoning agent built on OpenClaw, deployed on a VPS at `<SERVER_IP>`. It runs a KOI (Knowledge Organization Infrastructure) backend with a PostgreSQL knowledge graph and serves as the AI agent for the BKC CoIP (Bioregional Knowledge Commons Community of Inquiry & Practice).
 
 ## Production Server
 
-- **Host:** `45.132.245.30`
+- **Host:** `<SERVER_IP>`
 - **User:** `root`
 - **OS:** Ubuntu 24.04 LTS
-- **SSH:** `ssh root@45.132.245.30` (key-based auth configured)
+- **SSH:** `ssh root@<SERVER_IP>` (key-based auth configured)
 - **Resources:** 4 vCPU, 8GB RAM, 247GB disk
 
 ## Services
@@ -121,7 +121,7 @@ Private keys stored at `/root/koi-state/{node_name}_private_key.pem`.
 
 ## Quartz Knowledge Site — "Salish Sea Knowledge Garden"
 
-**URL:** `http://45.132.245.30`
+**URL:** `http://<SERVER_IP>`
 
 Quartz renders Octo's vault as a browsable static site with wikilinks, backlinks, graph view, and full-text search.
 
@@ -135,7 +135,7 @@ Quartz renders Octo's vault as a browsable static site with wikilinks, backlinks
 
 ### Manual rebuild
 ```bash
-ssh root@45.132.245.30 "/root/octo-quartz/rebuild.sh"
+ssh root@<SERVER_IP> "/root/octo-quartz/rebuild.sh"
 ```
 
 ### Update domain (when ready)
@@ -147,85 +147,85 @@ ssh root@45.132.245.30 "/root/octo-quartz/rebuild.sh"
 
 ### SSH to server
 ```bash
-ssh root@45.132.245.30
+ssh root@<SERVER_IP>
 ```
 
 ### Check all agents status
 ```bash
-ssh root@45.132.245.30 "bash ~/scripts/manage-agents.sh status"
+ssh root@<SERVER_IP> "bash ~/scripts/manage-agents.sh status"
 ```
 
 ### KOI API health check
 ```bash
-ssh root@45.132.245.30 "curl -s http://127.0.0.1:8351/health"   # Octo
-ssh root@45.132.245.30 "curl -s http://127.0.0.1:8352/health"   # GV
+ssh root@<SERVER_IP> "curl -s http://127.0.0.1:8351/health"   # Octo
+ssh root@<SERVER_IP> "curl -s http://127.0.0.1:8352/health"   # GV
 ```
 
 ### KOI-net health check
 ```bash
-ssh root@45.132.245.30 "curl -s http://127.0.0.1:8351/koi-net/health"
+ssh root@<SERVER_IP> "curl -s http://127.0.0.1:8351/koi-net/health"
 ```
 
 ### Restart agents (after code changes)
 ```bash
-ssh root@45.132.245.30 "bash ~/scripts/manage-agents.sh restart"
+ssh root@<SERVER_IP> "bash ~/scripts/manage-agents.sh restart"
 # Or individually:
-ssh root@45.132.245.30 "systemctl restart koi-api"       # Octo
-ssh root@45.132.245.30 "systemctl restart gv-koi-api"    # GV
+ssh root@<SERVER_IP> "systemctl restart koi-api"       # Octo
+ssh root@<SERVER_IP> "systemctl restart gv-koi-api"    # GV
 ```
 
 ### Deploy updated Python files
 ```bash
-scp koi-processor/api/*.py root@45.132.245.30:~/koi-processor/api/
-ssh root@45.132.245.30 "bash ~/scripts/manage-agents.sh restart"
+scp koi-processor/api/*.py root@<SERVER_IP>:~/koi-processor/api/
+ssh root@<SERVER_IP> "bash ~/scripts/manage-agents.sh restart"
 ```
 
 ### Deploy updated plugin + restart OpenClaw
 ```bash
-scp plugins/bioregional-koi/index.ts root@45.132.245.30:~/bioregional-koi/index.ts
-ssh root@45.132.245.30 "openclaw gateway restart"
+scp plugins/bioregional-koi/index.ts root@<SERVER_IP>:~/bioregional-koi/index.ts
+ssh root@<SERVER_IP> "openclaw gateway restart"
 ```
 
 ### Run federation test
 ```bash
-ssh root@45.132.245.30 "bash ~/scripts/test-federation.sh"
+ssh root@<SERVER_IP> "bash ~/scripts/test-federation.sh"
 ```
 
 ### Run interop test
 ```bash
-ssh root@45.132.245.30 "cd ~/koi-processor && venv/bin/python tests/test_koi_interop.py"
+ssh root@<SERVER_IP> "cd ~/koi-processor && venv/bin/python tests/test_koi_interop.py"
 ```
 
 ### Run a database migration
 ```bash
-cat koi-processor/migrations/038_bkc_predicates.sql | ssh root@45.132.245.30 "docker exec -i regen-koi-postgres psql -U postgres -d octo_koi"
+cat koi-processor/migrations/038_bkc_predicates.sql | ssh root@<SERVER_IP> "docker exec -i regen-koi-postgres psql -U postgres -d octo_koi"
 ```
 
 ### Query the database
 ```bash
-ssh root@45.132.245.30 "docker exec regen-koi-postgres psql -U postgres -d octo_koi -c 'SELECT * FROM allowed_predicates;'"
+ssh root@<SERVER_IP> "docker exec regen-koi-postgres psql -U postgres -d octo_koi -c 'SELECT * FROM allowed_predicates;'"
 ```
 
 ### Resolve an entity via API
 ```bash
-ssh root@45.132.245.30 'curl -s -X POST http://127.0.0.1:8351/entity/resolve -H "Content-Type: application/json" -d "{\"label\": \"Herring Monitoring\", \"type_hint\": \"Practice\"}"'
+ssh root@<SERVER_IP> 'curl -s -X POST http://127.0.0.1:8351/entity/resolve -H "Content-Type: application/json" -d "{\"label\": \"Herring Monitoring\", \"type_hint\": \"Practice\"}"'
 ```
 
 ### Test web URL preview
 ```bash
-ssh root@45.132.245.30 'curl -s -X POST http://127.0.0.1:8351/web/preview -H "Content-Type: application/json" -d "{\"url\": \"https://example.com\"}" | python3 -m json.tool'
+ssh root@<SERVER_IP> 'curl -s -X POST http://127.0.0.1:8351/web/preview -H "Content-Type: application/json" -d "{\"url\": \"https://example.com\"}" | python3 -m json.tool'
 ```
 
 ### View OpenClaw logs
 ```bash
-ssh root@45.132.245.30 "journalctl -u koi-api -f"
+ssh root@<SERVER_IP> "journalctl -u koi-api -f"
 ```
 
 ### Edit workspace files
 ```bash
-ssh root@45.132.245.30 "nano ~/.openclaw/workspace/KNOWLEDGE.md"
+ssh root@<SERVER_IP> "nano ~/.openclaw/workspace/KNOWLEDGE.md"
 # Or SCP from local:
-scp workspace/KNOWLEDGE.md root@45.132.245.30:~/.openclaw/workspace/
+scp workspace/KNOWLEDGE.md root@<SERVER_IP>:~/.openclaw/workspace/
 ```
 
 ## Databases
@@ -347,10 +347,10 @@ The source files in this repo map to server paths:
 
 ```bash
 # 1. Create database
-ssh root@45.132.245.30 "bash ~/koi-stack/create-additional-dbs.sh cv_koi"
+ssh root@<SERVER_IP> "bash ~/koi-stack/create-additional-dbs.sh cv_koi"
 
 # 2. Create agent directory (follow gv-agent/ pattern)
-ssh root@45.132.245.30 "mkdir -p ~/cv-agent/{config,workspace,vault}"
+ssh root@<SERVER_IP> "mkdir -p ~/cv-agent/{config,workspace,vault}"
 
 # 3. Create env file (copy gv.env, change DB_NAME, port, node name)
 
