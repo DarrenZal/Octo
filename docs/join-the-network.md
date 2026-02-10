@@ -268,31 +268,44 @@ Copy the config to your agent directory:
 cp config/cv.env /root/cv-agent/config/cv.env
 ```
 
-Run migrations (replace `cv_koi` with your database name in every line):
+Create the base schema by starting the API once (it auto-creates all core tables on first startup):
 
 ```bash
 source config/cv.env
 
-# Core schema (predicates, entity types)
+# Start the API briefly to create base tables, then stop it
+# (We'll set up the proper systemd service in Step 8)
+timeout 10 venv/bin/uvicorn api.personal_ingest_api:app --host 127.0.0.1 --port 8351 || true
+
+# Verify base tables were created
+docker exec regen-koi-postgres psql -U postgres -d cv_koi -c "\dt" | head -20
+```
+
+You should see tables like `entity_registry`, `allowed_predicates`, `entity_relationships`, etc.
+
+Now run the additional migrations (replace `cv_koi` with your database name):
+
+```bash
+# BKC ontology predicates (knowledge commoning, discourse graph, SKOS)
 cat migrations/038_bkc_predicates.sql | docker exec -i regen-koi-postgres psql -U postgres -d cv_koi
 
-# KOI-net tables (events, edges, nodes)
+# KOI-net tables (events, edges, nodes — required for federation)
 cat migrations/039_koi_net_events.sql | docker exec -i regen-koi-postgres psql -U postgres -d cv_koi
 
 # Ontology mappings
 cat migrations/039b_ontology_mappings.sql | docker exec -i regen-koi-postgres psql -U postgres -d cv_koi
 
-# Entity KOI RIDs
+# Entity KOI RIDs (federation identifiers)
 cat migrations/040_entity_koi_rids.sql | docker exec -i regen-koi-postgres psql -U postgres -d cv_koi
 
-# Cross-references (for federation)
+# Cross-references (for matching entities across nodes)
 cat migrations/041_cross_references.sql | docker exec -i regen-koi-postgres psql -U postgres -d cv_koi
 
-# Web submissions (optional — for URL ingestion)
+# Web submissions (optional — for URL ingestion pipeline)
 cat migrations/042_web_submissions.sql | docker exec -i regen-koi-postgres psql -U postgres -d cv_koi
 ```
 
-Each migration should print `CREATE TABLE` or similar — if you see errors, check your database name.
+Each migration should print `CREATE TABLE`, `INSERT`, or `ALTER TABLE`. Warnings about "already exists" are fine.
 
 ### Step 7: Create your agent identity
 
@@ -646,18 +659,22 @@ VAULT_PATH=/path/to/your/vault
 KOI_API_PORT=8351
 ```
 
-Run migrations (same as Path A Step 5) and start:
+Create base schema and run migrations:
 
 ```bash
 source config/mine.env
 
+# Start API briefly to create base tables, then stop
+timeout 10 venv/bin/uvicorn api.personal_ingest_api:app --host 127.0.0.1 --port 8351 || true
+
+# Run additional migrations
 cat migrations/038_bkc_predicates.sql | docker exec -i regen-koi-postgres psql -U postgres -d personal_koi
 cat migrations/039_koi_net_events.sql | docker exec -i regen-koi-postgres psql -U postgres -d personal_koi
 cat migrations/039b_ontology_mappings.sql | docker exec -i regen-koi-postgres psql -U postgres -d personal_koi
 cat migrations/040_entity_koi_rids.sql | docker exec -i regen-koi-postgres psql -U postgres -d personal_koi
 cat migrations/041_cross_references.sql | docker exec -i regen-koi-postgres psql -U postgres -d personal_koi
 
-# Start the API
+# Start the API for real
 uvicorn api.personal_ingest_api:app --host 127.0.0.1 --port 8351
 ```
 
