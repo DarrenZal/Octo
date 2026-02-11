@@ -241,6 +241,9 @@ scp workspace/KNOWLEDGE.md root@45.132.245.30:~/.openclaw/workspace/
 
 ### Fast checks
 ```bash
+# Idempotent local peer connect (upsert node+edge, send handshake, print reciprocal SQL)
+bash scripts/connect-koi-peer.sh --db <local_db> --peer-url http://<peer-ip>:8351
+
 # Is Cowichan polling Octo?
 ssh root@45.132.245.30 "journalctl -u koi-api --since '10 min ago' --no-pager | grep -E '202\\.61\\.242\\.194:0 - \\\"POST /koi-net/events/poll|Delivered .*cowichan|Confirmed .*cowichan'"
 
@@ -253,7 +256,7 @@ ssh root@45.132.245.30 "docker exec regen-koi-postgres psql -U postgres -d octo_
 
 ### Known failure modes
 - `POST /koi-net/events/poll` returns `400` with `No public key for ...`:
-  - Fix by upserting peer `public_key` in `koi_net_nodes` (or rerun handshake).
+  - Poller now retries with handshake automatically; if it persists, upsert peer `public_key` in `koi_net_nodes`.
 - Poller runs but never polls peers:
   - Edge is flipped. For POLL, `target_node` must equal self.
 - `404` on `/koi-net/poll`:

@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import asyncpg
+import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
@@ -90,6 +91,7 @@ async def setup_koi_net(pool: asyncpg.Pool):
         pool=pool,
         node_rid=_node_profile.node_rid,
         private_key=_private_key,
+        node_profile=_node_profile,
     )
     await _poller.start()
 
@@ -122,6 +124,71 @@ async def _get_peer_public_key(source_node: str):
     return None
 
 
+async def _refresh_peer_public_key(source_node: str):
+    """Best-effort key refresh from peer /koi-net/health when key is missing."""
+    if not _db_pool:
+        return None
+
+    async with _db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT base_url FROM koi_net_nodes WHERE node_rid = $1",
+            source_node,
+        )
+    if not row or not row["base_url"]:
+        return None
+
+    base_url = row["base_url"].rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(f"{base_url}/koi-net/health")
+        if resp.status_code != 200:
+            return None
+        health = resp.json()
+    except Exception:
+        return None
+
+    node = health.get("node") if isinstance(health, dict) else None
+    if not isinstance(node, dict):
+        return None
+
+    detected_rid = node.get("node_rid")
+    if detected_rid and detected_rid != source_node:
+        logger.warning(
+            f"Peer health RID mismatch for {base_url}: expected {source_node}, got {detected_rid}"
+        )
+        return None
+
+    public_key = node.get("public_key")
+    if not public_key:
+        return None
+
+    node_name = node.get("node_name") or source_node
+    node_type = node.get("node_type") or "FULL"
+    async with _db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO koi_net_nodes
+                (node_rid, node_name, node_type, base_url, public_key, status, last_seen)
+            VALUES ($1, $2, $3, $4, $5, 'active', NOW())
+            ON CONFLICT (node_rid) DO UPDATE SET
+                node_name = EXCLUDED.node_name,
+                node_type = EXCLUDED.node_type,
+                base_url = EXCLUDED.base_url,
+                public_key = EXCLUDED.public_key,
+                status = 'active',
+                last_seen = NOW()
+            """,
+            source_node,
+            node_name,
+            node_type,
+            base_url,
+            public_key,
+        )
+
+    logger.info(f"Refreshed public key for {source_node} from {base_url}/koi-net/health")
+    return load_public_key_from_der_b64(public_key)
+
+
 async def _unwrap_request(request: Request):
     """Parse request body, optionally unwrapping SignedEnvelope.
 
@@ -135,6 +202,8 @@ async def _unwrap_request(request: Request):
     if is_signed_envelope(body):
         source_node = body.get("source_node")
         public_key = await _get_peer_public_key(source_node)
+        if not public_key:
+            public_key = await _refresh_peer_public_key(source_node)
         if not public_key:
             raise EnvelopeError(f"No public key for {source_node}")
         payload, source = verify_envelope(body, public_key)

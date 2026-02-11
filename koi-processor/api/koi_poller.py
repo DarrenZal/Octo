@@ -26,7 +26,7 @@ import asyncpg
 import httpx
 
 from api.koi_envelope import sign_envelope, is_signed_envelope, verify_envelope, load_public_key_from_der_b64
-from api.koi_protocol import timestamp_to_z_format
+from api.koi_protocol import NodeProfile, timestamp_to_z_format
 
 logger = logging.getLogger(__name__)
 
@@ -45,11 +45,13 @@ class KOIPoller:
         pool: asyncpg.Pool,
         node_rid: str,
         private_key=None,
+        node_profile: Optional[NodeProfile] = None,
         poll_interval: int = DEFAULT_POLL_INTERVAL,
     ):
         self.pool = pool
         self.node_rid = node_rid
         self.private_key = private_key
+        self.node_profile = node_profile
         self.poll_interval = poll_interval
         self._task: Optional[asyncio.Task] = None
         self._running = False
@@ -136,6 +138,88 @@ class KOIPoller:
                 self._backoff[source_node] = failures + 1
                 logger.warning(f"Poll failed for {source_node}: {e}")
 
+    async def _learn_peer_public_key(
+        self,
+        source_node: str,
+        base_url: str,
+    ) -> Optional[str]:
+        """Fetch a peer public key from /koi-net/health and persist it locally."""
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(f"{base_url}/koi-net/health")
+            if resp.status_code != 200:
+                return None
+            health = resp.json()
+        except Exception:
+            return None
+
+        node = health.get("node") if isinstance(health, dict) else None
+        if not isinstance(node, dict):
+            return None
+
+        detected_rid = node.get("node_rid")
+        if detected_rid and detected_rid != source_node:
+            logger.warning(
+                f"Peer health RID mismatch for {base_url}: expected {source_node}, got {detected_rid}"
+            )
+            return None
+
+        public_key = node.get("public_key")
+        if not public_key:
+            return None
+
+        node_name = node.get("node_name") or source_node
+        node_type = node.get("node_type") or "FULL"
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO koi_net_nodes
+                    (node_rid, node_name, node_type, base_url, public_key, status, last_seen)
+                VALUES ($1, $2, $3, $4, $5, 'active', NOW())
+                ON CONFLICT (node_rid) DO UPDATE SET
+                    node_name = EXCLUDED.node_name,
+                    node_type = EXCLUDED.node_type,
+                    base_url = EXCLUDED.base_url,
+                    public_key = EXCLUDED.public_key,
+                    status = 'active',
+                    last_seen = NOW()
+                """,
+                source_node,
+                node_name,
+                node_type,
+                base_url,
+                public_key,
+            )
+
+        logger.info(f"Learned public key for {source_node} from {base_url}/koi-net/health")
+        return public_key
+
+    async def _send_handshake(self, source_node: str, base_url: str) -> bool:
+        """Send unsigned handshake so peers can register our public key/profile."""
+        if not self.node_profile:
+            return False
+
+        payload = {
+            "type": "handshake",
+            "profile": self.node_profile.model_dump(exclude_none=True),
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(f"{base_url}/koi-net/handshake", json=payload)
+        except Exception as exc:
+            logger.warning(f"Handshake to {source_node} failed: {exc}")
+            return False
+
+        if resp.status_code == 200:
+            logger.info(f"Handshake accepted by {source_node}; peer should now have our public key")
+            return True
+
+        logger.warning(
+            f"Handshake to {source_node} failed: HTTP {resp.status_code} {resp.text[:200]}"
+        )
+        return False
+
     async def _poll_peer(
         self,
         source_node: str,
@@ -161,14 +245,41 @@ class KOIPoller:
             )
 
         if resp.status_code != 200:
-            logger.warning(f"Poll {source_node}: HTTP {resp.status_code}")
-            return
+            # Common first-run failure: remote peer doesn't yet have our public key.
+            # Attempt a handshake and retry once before giving up.
+            if (
+                resp.status_code == 400
+                and "No public key for" in resp.text
+                and self.node_profile is not None
+            ):
+                logger.info(
+                    f"Poll {source_node}: missing key on peer, attempting handshake self-heal"
+                )
+                if await self._send_handshake(source_node, base_url):
+                    async with httpx.AsyncClient(timeout=30.0) as client:
+                        resp = await client.post(
+                            f"{base_url}/koi-net/events/poll", json=request_body
+                        )
+
+            if resp.status_code != 200:
+                logger.warning(
+                    f"Poll {source_node}: HTTP {resp.status_code} {resp.text[:200]}"
+                )
+                return
 
         result = resp.json()
 
         # Unwrap signed response if present
-        if is_signed_envelope(result) and peer_public_key_b64:
-            pub_key = load_public_key_from_der_b64(peer_public_key_b64)
+        if is_signed_envelope(result):
+            effective_peer_key = peer_public_key_b64
+            if not effective_peer_key:
+                effective_peer_key = await self._learn_peer_public_key(source_node, base_url)
+            if not effective_peer_key:
+                logger.warning(
+                    f"Poll {source_node}: signed response but no peer public key is available"
+                )
+                return
+            pub_key = load_public_key_from_der_b64(effective_peer_key)
             payload, _ = verify_envelope(result, pub_key)
             events = payload.get("events", [])
         else:

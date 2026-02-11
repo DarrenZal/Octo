@@ -334,9 +334,11 @@ bash "$OCTO_DIR/scripts/seed-vault-entities.sh" "http://127.0.0.1:$API_PORT" "$A
 header "Federation Setup"
 
 # Get node RID + public key
-NODE_RID=$(curl -s "http://127.0.0.1:$API_PORT/koi-net/health" 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); n=d.get('node') or {}; print(n.get('node_rid') or d.get('node_rid',''))" 2>/dev/null || echo "")
-NODE_PUBLIC_KEY=$(curl -s "http://127.0.0.1:$API_PORT/koi-net/health" 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); n=d.get('node') or {}; print(n.get('public_key') or '')" 2>/dev/null || echo "")
+NODE_HEALTH=$(curl -s "http://127.0.0.1:$API_PORT/koi-net/health" 2>/dev/null || echo "")
+NODE_RID=$(echo "$NODE_HEALTH" | python3 -c "import sys,json; d=json.load(sys.stdin); n=d.get('node') or {}; print(n.get('node_rid') or d.get('node_rid',''))" 2>/dev/null || echo "")
+NODE_PUBLIC_KEY=$(echo "$NODE_HEALTH" | python3 -c "import sys,json; d=json.load(sys.stdin); n=d.get('node') or {}; print(n.get('public_key') or '')" 2>/dev/null || echo "")
 NODE_BASE_URL_FOR_COORD="$KOI_BASE_URL_DEFAULT"
+COORD_HANDSHAKE_STATUS="not_attempted"
 
 if [ -z "$NODE_RID" ]; then
   warn "Could not read node RID from /koi-net/health."
@@ -409,6 +411,27 @@ else
     echo "INSERT INTO koi_net_edges (edge_rid, source_node, target_node, edge_type, status, rid_types) VALUES ('$EDGE_RID', '$COORD_RID', '$NODE_RID', 'POLL', 'APPROVED', '$RID_TYPES') ON CONFLICT (edge_rid) DO UPDATE SET source_node = EXCLUDED.source_node, target_node = EXCLUDED.target_node, edge_type = EXCLUDED.edge_type, status = 'APPROVED', rid_types = EXCLUDED.rid_types, updated_at = now();" | $PSQL_FED &>/dev/null
     ok "Edge created: $NODE_SLUG polls $COORD_NAME"
 
+    # Proactively register this node profile on coordinator via handshake.
+    # This reduces first-poll 400s from missing peer public keys.
+    HANDSHAKE_PAYLOAD=$(echo "$NODE_HEALTH" | python3 -c "import sys,json; d=json.load(sys.stdin); n=d.get('node') or {}; print(json.dumps({'type':'handshake','profile':n}, separators=(',',':'))) if n else print('')" 2>/dev/null || echo "")
+    if [ -n "$HANDSHAKE_PAYLOAD" ]; then
+      info "Sending handshake to coordinator..."
+      HANDSHAKE_HTTP=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" \
+        -H "Content-Type: application/json" \
+        -X POST "$COORD_URL/koi-net/handshake" \
+        -d "$HANDSHAKE_PAYLOAD" || echo "000")
+      if [ "$HANDSHAKE_HTTP" = "200" ]; then
+        ok "Handshake accepted by coordinator (node/profile registered)"
+        COORD_HANDSHAKE_STATUS="ok"
+      else
+        warn "Coordinator handshake returned HTTP $HANDSHAKE_HTTP. They may need to upsert your node manually."
+        COORD_HANDSHAKE_STATUS="failed"
+      fi
+    else
+      warn "Could not build local node profile for coordinator handshake."
+      COORD_HANDSHAKE_STATUS="failed"
+    fi
+
     # Check if port is open
     if [ -n "$PUBLIC_IP" ]; then
       info "Checking if port $API_PORT is reachable from outside..."
@@ -448,8 +471,13 @@ echo ""
 
 if [ "${FEDERATION_DONE:-}" = "true" ]; then
   echo -e "${GREEN}Federation (your side) is configured.${NC}"
+  if [ "${COORD_HANDSHAKE_STATUS:-}" = "ok" ]; then
+    echo "Coordinator handshake: succeeded (peer key/profile should already be registered)."
+  elif [ "${COORD_HANDSHAKE_STATUS:-}" = "failed" ]; then
+    echo "Coordinator handshake: failed (send the SQL block below to coordinator)."
+  fi
   echo ""
-  echo "The coordinator still needs to register your node. Send them this one-liner:"
+  echo "Coordinator still needs to ensure/update reciprocal edge config. Send this one-liner:"
   echo ""
   echo -e "${BOLD}────────────────── copy this ──────────────────${NC}"
   echo ""

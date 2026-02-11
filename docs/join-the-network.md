@@ -866,6 +866,19 @@ If you decide you want a chat interface, follow Path A Step 9 to add OpenClaw on
 
 This section applies to **all paths** once your node is running and you want to connect to the network.
 
+### Discovery and peer selection
+
+KOI-net currently uses **introduction-based discovery** (no global auto-discovery mesh yet):
+
+1. A node shares its `KOI_BASE_URL` (or KOI gateway URL).
+2. The other side checks `/koi-net/health` to verify `node_rid` and `public_key`.
+3. Both sides decide whether to create explicit edges.
+
+How to decide who to connect to:
+- **Leaf node:** connect to one coordinator for your bioregion.
+- **Peer network:** connect to a small set of trusted peers with shared ontology/governance goals.
+- Keep `rid_types` narrow at first (least exposure), then widen after validation.
+
 ### How KOI-net handshake works
 
 1. Your node starts with `KOI_NET_ENABLED=true` and generates an ECDSA P-256 keypair (stored in `KOI_STATE_DIR`)
@@ -881,10 +894,22 @@ If you used the setup wizard (`scripts/setup-node.sh`), federation was offered a
 
 1. Registers the coordinator (Octo) as a known node on your side (with `public_key` when available)
 2. Creates the edge (your node polls the coordinator) with conflict-safe upsert (fixes flipped orientation on rerun)
-3. Checks if your API port is reachable from outside
-4. **Prints a one-liner** for the coordinator to run on their side (includes your `public_key`)
+3. Sends a KOI handshake to the coordinator (pre-registers your key/profile to avoid first-poll key errors)
+4. Checks if your API port is reachable from outside
+5. **Prints a one-liner** for the coordinator to run on their side (includes your `public_key`)
 
 Copy that one-liner and send it to the coordinator (Darren for Salish Sea). Once they run it, both sides are wired up and knowledge starts flowing.
+
+### One-command peer connect helper
+
+For existing nodes (or non-Octo coordinators), use the idempotent helper:
+
+```bash
+# On your node: register peer + create edge + send handshake + print reciprocal SQL
+bash /root/Octo/scripts/connect-koi-peer.sh --db <your_db> --peer-url http://<peer-ip>:8351
+```
+
+This removes most manual SQL copy/paste and reduces edge/key orientation mistakes.
 
 ### Manual setup
 

@@ -162,6 +162,7 @@ See [ontology/bkc-ontology.jsonld](ontology/bkc-ontology.jsonld) for the formal 
 ├── scripts/                # Multi-agent management
 │   ├── manage-agents.sh    # Start/stop/status for all agents
 │   ├── agents.conf         # Agent registry (name:service:port)
+│   ├── connect-koi-peer.sh # Idempotent peer/coordinator connect helper
 │   └── test-federation.sh  # End-to-end federation test
 ├── ontology/               # Formal BKC ontology (JSON-LD)
 │   └── bkc-ontology.jsonld
@@ -226,6 +227,7 @@ Federation readiness checklist (critical):
   - `target_node` = node doing the polling
 - Ensure each peer's `public_key` is present in `koi_net_nodes` on the other side.
 - Use `POST /koi-net/events/poll` (legacy `POST /koi-net/poll` is not supported).
+- Prefer `bash scripts/connect-koi-peer.sh --db <db> --peer-url <url>` for idempotent local setup.
 
 Quick federation sanity checks:
 ```bash
@@ -239,6 +241,24 @@ docker exec regen-koi-postgres psql -U postgres -d <db_name> -c \
 # Check peer keys
 docker exec regen-koi-postgres psql -U postgres -d <db_name> -c \
   "SELECT node_rid, node_name, length(public_key) AS key_len FROM koi_net_nodes;"
+```
+
+### Discovery And Peer Selection
+
+Current KOI-net discovery is **introduction-based**, not automatic gossip/discovery:
+- Nodes discover each other by sharing `KOI_BASE_URL` + `node_rid` out-of-band (human coordination, registry docs, trusted intros).
+- Each side verifies identity from `/koi-net/health` (`node_rid`, `public_key`) before creating edges.
+
+How nodes decide who to connect to:
+- **Leaf nodes** connect to one coordinator for their bioregion.
+- **Peer networks** connect to a small set of trusted peers with overlapping goals/ontology.
+- Edge `rid_types` define the exchange scope (principle of least exposure).
+- Prefer explicit trust/governance agreements over broad, automatic peering.
+
+Practical bootstrap pattern:
+```bash
+# Run on each side (or at least on the initiating side)
+bash scripts/connect-koi-peer.sh --db <local_db> --peer-url http://<peer-ip>:8351
 ```
 
 ### Multi-Agent Management
