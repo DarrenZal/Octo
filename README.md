@@ -203,12 +203,11 @@ uvicorn api.personal_ingest_api:app --host 127.0.0.1 --port 8351
 ### Adding a Leaf Node
 
 ```bash
-# Create database for new agent
-bash docker/create-additional-dbs.sh gv_koi
+# Recommended: run the interactive setup wizard
+bash scripts/setup-node.sh
 
-# Configure and start (see gv-agent/ for example)
-# Set KOI_NET_ENABLED=true in env for federation
-bash scripts/manage-agents.sh status
+# Manual path (advanced): create DB + service/env yourself
+bash docker/create-additional-dbs.sh gv_koi
 ```
 
 ### KOI-net Federation
@@ -218,6 +217,29 @@ Enable federation by setting `KOI_NET_ENABLED=true` in the agent's env file. Thi
 - ECDSA P-256 signed envelopes for authenticated communication
 - Background poller for event-driven cross-reference creation
 - Auto-generated node identity (keypair stored in `/root/koi-state/`)
+
+Federation readiness checklist (critical):
+- Set `KOI_BASE_URL` to a peer-reachable URL (not localhost), e.g. `http://<public-ip>:8351`.
+- Ensure peers can reach `/koi-net/*` on that URL (direct bind or reverse proxy).
+- Use edge semantics correctly for polling:
+  - `source_node` = node being polled (data provider)
+  - `target_node` = node doing the polling
+- Ensure each peer's `public_key` is present in `koi_net_nodes` on the other side.
+- Use `POST /koi-net/events/poll` (legacy `POST /koi-net/poll` is not supported).
+
+Quick federation sanity checks:
+```bash
+# Local node identity and advertised base URL
+curl -s http://127.0.0.1:8351/koi-net/health | python3 -m json.tool
+
+# Check edge orientation
+docker exec regen-koi-postgres psql -U postgres -d <db_name> -c \
+  "SELECT edge_rid, source_node, target_node, status FROM koi_net_edges;"
+
+# Check peer keys
+docker exec regen-koi-postgres psql -U postgres -d <db_name> -c \
+  "SELECT node_rid, node_name, length(public_key) AS key_len FROM koi_net_nodes;"
+```
 
 ### Multi-Agent Management
 

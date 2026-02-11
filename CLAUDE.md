@@ -19,6 +19,7 @@ Octo is a bioregional knowledge commoning agent built on OpenClaw, deployed on a
 | Service | How it runs | Port | Details |
 |---------|------------|------|---------|
 | **Octo KOI API** | systemd (`koi-api.service`) | 8351 (localhost) | uvicorn, Python 3.12, KOI-net enabled |
+| **KOI Federation Gateway** | nginx (`octo-koi-net-8351`) | 8351 (public IP) | Proxies only `/koi-net/*` and `/health` to Octo API |
 | **GV KOI API** | systemd (`gv-koi-api.service`) | 8352 (localhost) | Greater Victoria leaf node, KOI-net enabled |
 | **PostgreSQL** | Docker (`regen-koi-postgres`) | 5432 (localhost) | pgvector + Apache AGE, multiple DBs |
 | **OpenClaw** | OpenClaw runtime (v2026.2.2-3) | — | Telegram + Discord channels |
@@ -132,6 +133,7 @@ Quartz renders Octo's vault as a browsable static site with wikilinks, backlinks
 
 ### Config
 - **nginx:** `/etc/nginx/sites-available/octo-quartz`
+- **KOI gateway nginx:** `/etc/nginx/sites-available/octo-koi-net-8351`
 - **Quartz config:** `/root/octo-quartz/quartz.config.ts`
 - **TLS cert deployment:** `/etc/nginx/ssl/octo-sslip-fullchain.pem` + `/etc/nginx/ssl/octo-sslip.key`
 - **ACME client:** `~/.acme.sh/acme.sh` (ZeroSSL)
@@ -170,6 +172,7 @@ ssh root@45.132.245.30 "curl -s http://127.0.0.1:8352/health"   # GV
 ### KOI-net health check
 ```bash
 ssh root@45.132.245.30 "curl -s http://127.0.0.1:8351/koi-net/health"
+curl -s http://45.132.245.30:8351/koi-net/health   # Public KOI gateway path
 ```
 
 ### Restart agents (after code changes)
@@ -233,6 +236,30 @@ ssh root@45.132.245.30 "nano ~/.openclaw/workspace/KNOWLEDGE.md"
 # Or SCP from local:
 scp workspace/KNOWLEDGE.md root@45.132.245.30:~/.openclaw/workspace/
 ```
+
+## KOI-net Federation Debugging
+
+### Fast checks
+```bash
+# Is Cowichan polling Octo?
+ssh root@45.132.245.30 "journalctl -u koi-api --since '10 min ago' --no-pager | grep -E '202\\.61\\.242\\.194:0 - \\\"POST /koi-net/events/poll|Delivered .*cowichan|Confirmed .*cowichan'"
+
+# Do we have peer public keys?
+ssh root@45.132.245.30 "docker exec regen-koi-postgres psql -U postgres -d octo_koi -c \"SELECT node_rid, node_name, length(public_key) AS key_len, base_url FROM koi_net_nodes ORDER BY node_name;\""
+
+# Is edge orientation correct? (source = provider, target = poller)
+ssh root@45.132.245.30 "docker exec regen-koi-postgres psql -U postgres -d octo_koi -c \"SELECT edge_rid, source_node, target_node, status FROM koi_net_edges WHERE edge_rid LIKE '%polls%';\""
+```
+
+### Known failure modes
+- `POST /koi-net/events/poll` returns `400` with `No public key for ...`:
+  - Fix by upserting peer `public_key` in `koi_net_nodes` (or rerun handshake).
+- Poller runs but never polls peers:
+  - Edge is flipped. For POLL, `target_node` must equal self.
+- `404` on `/koi-net/poll`:
+  - Use `/koi-net/events/poll` (legacy path removed).
+- Peer cannot reach Octo:
+  - Ensure nginx KOI gateway is up (`/etc/nginx/sites-available/octo-koi-net-8351`) and `KOI_BASE_URL` is public.
 
 ## Databases
 

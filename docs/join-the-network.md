@@ -256,8 +256,10 @@ VAULT_PATH=/root/<your-shortname>-agent/vault
 KOI_NET_ENABLED=true
 KOI_NODE_NAME=<your-node-name>
 KOI_STATE_DIR=/root/koi-state
+KOI_BASE_URL=http://<your-public-ip>:8351
 
 # API
+KOI_API_HOST=0.0.0.0
 KOI_API_PORT=8351
 ```
 
@@ -269,6 +271,8 @@ OPENAI_API_KEY=sk-proj-abc123...
 VAULT_PATH=/root/cv-agent/vault
 KOI_NODE_NAME=cowichan-valley
 ```
+
+`KOI_BASE_URL` must be reachable by peers. If you keep the API bound to localhost, expose `/koi-net/*` through nginx and set `KOI_BASE_URL` to that public URL.
 
 Copy the config to your agent directory:
 
@@ -457,7 +461,7 @@ User=root
 WorkingDirectory=/root/Octo/koi-processor
 Environment=PATH=/root/Octo/koi-processor/venv/bin:/usr/bin
 EnvironmentFile=/root/cv-agent/config/cv.env
-ExecStart=/root/Octo/koi-processor/venv/bin/uvicorn api.personal_ingest_api:app --host 127.0.0.1 --port 8351
+ExecStart=/root/Octo/koi-processor/venv/bin/uvicorn api.personal_ingest_api:app --host 0.0.0.0 --port 8351
 Restart=on-failure
 RestartSec=5
 
@@ -477,7 +481,7 @@ sleep 5
 curl -s http://127.0.0.1:8351/health | python3 -m json.tool
 ```
 
-You should see a JSON response with `"status": "ok"`. If you get "Connection refused", check logs: `journalctl -u cv-koi-api -n 50`
+You should see a JSON response with `"status": "healthy"`. If you get "Connection refused", check logs: `journalctl -u cv-koi-api -n 50`
 
 ### Step 9: Seed entities
 
@@ -875,10 +879,10 @@ This section applies to **all paths** once your node is running and you want to 
 
 If you used the setup wizard (`scripts/setup-node.sh`), federation was offered as part of the setup. The wizard:
 
-1. Registers the coordinator (Octo) as a known node on your side
-2. Creates the edge (your node polls the coordinator)
+1. Registers the coordinator (Octo) as a known node on your side (with `public_key` when available)
+2. Creates the edge (your node polls the coordinator) with conflict-safe upsert (fixes flipped orientation on rerun)
 3. Checks if your API port is reachable from outside
-4. **Prints a one-liner** for the coordinator to run on their side
+4. **Prints a one-liner** for the coordinator to run on their side (includes your `public_key`)
 
 Copy that one-liner and send it to the coordinator (Darren for Salish Sea). Once they run it, both sides are wired up and knowledge starts flowing.
 
@@ -893,11 +897,20 @@ If you didn't use the wizard, or are connecting to a different coordinator:
 # Replace YOUR_NODE_RID with your node RID from: curl -s http://127.0.0.1:8351/koi-net/health
 
 docker exec -i regen-koi-postgres psql -U postgres -d YOUR_DB <<'SQL'
+-- (Optional but recommended) fetch coordinator public key:
+-- curl -s http://45.132.245.30:8351/koi-net/health | python3 -c "import sys,json; d=json.load(sys.stdin); print((d.get('node') or {}).get('public_key',''))"
+
 -- Register Octo (Salish Sea coordinator)
-INSERT INTO koi_net_nodes (node_rid, node_name, node_type, base_url, status, last_seen)
+INSERT INTO koi_net_nodes (node_rid, node_name, node_type, base_url, public_key, status, last_seen)
   VALUES ('orn:koi-net.node:octo-salish-sea+50a3c9eac05c807f', 'octo-salish-sea', 'FULL',
-          'http://45.132.245.30:8351', 'active', now())
-  ON CONFLICT (node_rid) DO NOTHING;
+          'http://45.132.245.30:8351', '<OCTO_PUBLIC_KEY_BASE64>', 'active', now())
+  ON CONFLICT (node_rid) DO UPDATE SET
+    node_name = EXCLUDED.node_name,
+    node_type = EXCLUDED.node_type,
+    base_url = EXCLUDED.base_url,
+    public_key = COALESCE(EXCLUDED.public_key, koi_net_nodes.public_key),
+    status = 'active',
+    last_seen = now();
 
 -- Create edge: your node polls Octo for practices/patterns/case studies/bioregions
 -- Edge semantics: source = data provider (Octo), target = poller (your node)
@@ -906,11 +919,17 @@ INSERT INTO koi_net_edges (edge_rid, source_node, target_node, edge_type, status
           'orn:koi-net.node:octo-salish-sea+50a3c9eac05c807f',
           'YOUR_NODE_RID',
           'POLL', 'APPROVED', '{Practice,Pattern,CaseStudy,Bioregion}')
-  ON CONFLICT (edge_rid) DO NOTHING;
+  ON CONFLICT (edge_rid) DO UPDATE SET
+    source_node = EXCLUDED.source_node,
+    target_node = EXCLUDED.target_node,
+    edge_type = EXCLUDED.edge_type,
+    status = 'APPROVED',
+    rid_types = EXCLUDED.rid_types,
+    updated_at = now();
 SQL
 ```
 
-**Then send the coordinator** your IP, port, and Node RID so they can register your node on their side.
+**Then send the coordinator** your IP, port, Node RID, and public key so they can register your node on their side.
 
 ### What happens on both sides
 
@@ -951,7 +970,10 @@ bash ~/scripts/test-federation.sh
 | Problem | Check |
 |---|---|
 | Node not starting | `journalctl -u your-koi-api -f` — check for Python errors |
-| No events flowing | Verify both sides have edges configured; check firewall allows port 8351 |
+| No events flowing | Verify both sides have edges configured; check firewall allows port 8351 and that `KOI_BASE_URL` is peer-reachable |
+| Poller runs but no peers found | Edge orientation is flipped. For POLL edges: `source_node` must be the node being polled and `target_node` must be self |
+| `POST /koi-net/events/poll` returns 400 `No public key for ...` | The polled node is missing your `public_key` in `koi_net_nodes`; run handshake or upsert peer key |
+| Poll endpoint 404 | Use `POST /koi-net/events/poll` (not legacy `POST /koi-net/poll`) |
 | Events received but no cross-refs | Entity types may not overlap — check `koi_net_edges` RID type filters |
 | "Invalid signature" errors | Keypair mismatch — verify public keys match in `koi_net_nodes` on both sides |
 | Connection timeout | Firewall, wrong IP, or the other node is down |

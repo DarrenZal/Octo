@@ -138,6 +138,21 @@ echo "KOI API port (default 8351). Change if running multiple nodes on one serve
 read -rp "  API port [$API_PORT]: " INPUT_PORT
 API_PORT="${INPUT_PORT:-$API_PORT}"
 
+# Bind host + base URL defaults
+PUBLIC_IP=$(curl -s --max-time 5 ifconfig.me 2>/dev/null || echo "")
+if [ "$NODE_TYPE_NUM" = "3" ]; then
+  API_BIND_HOST="127.0.0.1"
+else
+  API_BIND_HOST="0.0.0.0"
+fi
+
+if [ -n "$PUBLIC_IP" ]; then
+  KOI_BASE_URL_DEFAULT="http://$PUBLIC_IP:$API_PORT"
+else
+  KOI_BASE_URL_DEFAULT="http://127.0.0.1:$API_PORT"
+  warn "Could not detect public IP. KOI_BASE_URL defaults to localhost; update it for federation."
+fi
+
 # ─── Create everything ───
 header "Setting Up Node"
 
@@ -177,8 +192,10 @@ VAULT_PATH=$AGENT_DIR/vault
 KOI_NET_ENABLED=true
 KOI_NODE_NAME=$NODE_SLUG
 KOI_STATE_DIR=/root/koi-state
+KOI_BASE_URL=$KOI_BASE_URL_DEFAULT
 
 # API
+KOI_API_HOST=$API_BIND_HOST
 KOI_API_PORT=$API_PORT
 ENVEOF
 
@@ -286,7 +303,7 @@ User=root
 WorkingDirectory=$OCTO_DIR/koi-processor
 Environment=PATH=$OCTO_DIR/koi-processor/venv/bin:/usr/bin
 EnvironmentFile=$ENV_FILE
-ExecStart=$OCTO_DIR/koi-processor/venv/bin/uvicorn api.personal_ingest_api:app --host 127.0.0.1 --port $API_PORT
+ExecStart=$OCTO_DIR/koi-processor/venv/bin/uvicorn api.personal_ingest_api:app --host $API_BIND_HOST --port $API_PORT
 Restart=on-failure
 RestartSec=5
 
@@ -303,7 +320,7 @@ ok "Service $SERVICE_NAME started"
 info "Waiting for API to start..."
 sleep 5
 
-if curl -s "http://127.0.0.1:$API_PORT/health" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status',''))" 2>/dev/null | grep -q ok; then
+if curl -s "http://127.0.0.1:$API_PORT/health" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status',''))" 2>/dev/null | grep -qi healthy; then
   ok "API is healthy!"
 else
   warn "API may still be starting. Check: journalctl -u $SERVICE_NAME -f"
@@ -316,9 +333,14 @@ bash "$OCTO_DIR/scripts/seed-vault-entities.sh" "http://127.0.0.1:$API_PORT" "$A
 # ─── Federation Setup ───
 header "Federation Setup"
 
-# Get node RID
-NODE_RID=$(curl -s "http://127.0.0.1:$API_PORT/koi-net/health" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('node_rid',''))" 2>/dev/null || echo "")
-PUBLIC_IP=$(curl -s --max-time 5 ifconfig.me 2>/dev/null || echo "")
+# Get node RID + public key
+NODE_RID=$(curl -s "http://127.0.0.1:$API_PORT/koi-net/health" 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); n=d.get('node') or {}; print(n.get('node_rid') or d.get('node_rid',''))" 2>/dev/null || echo "")
+NODE_PUBLIC_KEY=$(curl -s "http://127.0.0.1:$API_PORT/koi-net/health" 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); n=d.get('node') or {}; print(n.get('public_key') or '')" 2>/dev/null || echo "")
+NODE_BASE_URL_FOR_COORD="$KOI_BASE_URL_DEFAULT"
+
+if [ -z "$NODE_RID" ]; then
+  warn "Could not read node RID from /koi-net/health."
+fi
 
 if [ "$NODE_TYPE_NUM" = "3" ]; then
   info "Personal/research node — skipping federation (you can set it up later)"
@@ -344,21 +366,47 @@ else
       read -rp "  Coordinator URL (e.g. http://1.2.3.4:8351): " COORD_URL
     fi
 
+    # Try to discover coordinator RID/public key from health endpoint
+    COORD_HEALTH=$(curl -s --max-time 8 "$COORD_URL/koi-net/health" 2>/dev/null || echo "")
+    COORD_PUBLIC_KEY=""
+    if [ -n "$COORD_HEALTH" ]; then
+      COORD_RID_DETECTED=$(echo "$COORD_HEALTH" | python3 -c "import sys,json; d=json.load(sys.stdin); n=d.get('node') or {}; print(n.get('node_rid') or d.get('node_rid',''))" 2>/dev/null || echo "")
+      COORD_PUBLIC_KEY=$(echo "$COORD_HEALTH" | python3 -c "import sys,json; d=json.load(sys.stdin); n=d.get('node') or {}; print(n.get('public_key') or '')" 2>/dev/null || echo "")
+      if [ -n "$COORD_RID_DETECTED" ] && [ "$COORD_RID_DETECTED" != "$COORD_RID" ]; then
+        warn "Coordinator RID mismatch (configured=$COORD_RID, detected=$COORD_RID_DETECTED). Using detected RID."
+        COORD_RID="$COORD_RID_DETECTED"
+      fi
+    else
+      warn "Could not fetch coordinator health from $COORD_URL"
+    fi
+
     # Edge RID: shortname-polls-coordinator
     EDGE_RID="orn:koi-net.edge:${NODE_SLUG}-polls-${COORD_NAME}"
     RID_TYPES="{Practice,Pattern,CaseStudy,Bioregion}"
 
     PSQL_FED="docker exec -i regen-koi-postgres psql -U postgres -d $DB_NAME"
+    if [ -n "$COORD_PUBLIC_KEY" ]; then
+      COORD_PUBLIC_KEY_SQL="'$COORD_PUBLIC_KEY'"
+    else
+      COORD_PUBLIC_KEY_SQL="NULL"
+      warn "Coordinator public key unavailable. Signed response verification may fail."
+    fi
+    if [ -n "$NODE_PUBLIC_KEY" ]; then
+      NODE_PUBLIC_KEY_SQL="'$NODE_PUBLIC_KEY'"
+    else
+      NODE_PUBLIC_KEY_SQL="NULL"
+      warn "Local node public key unavailable. Coordinator must add it manually."
+    fi
 
     # Register coordinator as known node
     info "Registering coordinator node..."
-    echo "INSERT INTO koi_net_nodes (node_rid, node_name, node_type, base_url, status, last_seen) VALUES ('$COORD_RID', '$COORD_NAME', 'FULL', '$COORD_URL', 'active', now()) ON CONFLICT (node_rid) DO NOTHING;" | $PSQL_FED &>/dev/null
+    echo "INSERT INTO koi_net_nodes (node_rid, node_name, node_type, base_url, public_key, status, last_seen) VALUES ('$COORD_RID', '$COORD_NAME', 'FULL', '$COORD_URL', $COORD_PUBLIC_KEY_SQL, 'active', now()) ON CONFLICT (node_rid) DO UPDATE SET node_name = EXCLUDED.node_name, node_type = EXCLUDED.node_type, base_url = EXCLUDED.base_url, public_key = COALESCE(EXCLUDED.public_key, koi_net_nodes.public_key), status = 'active', last_seen = now();" | $PSQL_FED &>/dev/null
     ok "Coordinator registered: $COORD_NAME"
 
     # Create edge: this node polls the coordinator
     # Edge semantics: source = data provider (coordinator), target = poller (this node)
     info "Creating federation edge..."
-    echo "INSERT INTO koi_net_edges (edge_rid, source_node, target_node, edge_type, status, rid_types) VALUES ('$EDGE_RID', '$COORD_RID', '$NODE_RID', 'POLL', 'APPROVED', '$RID_TYPES') ON CONFLICT (edge_rid) DO NOTHING;" | $PSQL_FED &>/dev/null
+    echo "INSERT INTO koi_net_edges (edge_rid, source_node, target_node, edge_type, status, rid_types) VALUES ('$EDGE_RID', '$COORD_RID', '$NODE_RID', 'POLL', 'APPROVED', '$RID_TYPES') ON CONFLICT (edge_rid) DO UPDATE SET source_node = EXCLUDED.source_node, target_node = EXCLUDED.target_node, edge_type = EXCLUDED.edge_type, status = 'APPROVED', rid_types = EXCLUDED.rid_types, updated_at = now();" | $PSQL_FED &>/dev/null
     ok "Edge created: $NODE_SLUG polls $COORD_NAME"
 
     # Check if port is open
@@ -387,7 +435,9 @@ echo "  Database:         $DB_NAME"
 echo "  Agent directory:  $AGENT_DIR"
 echo "  Config file:      $ENV_FILE"
 echo "  systemd service:  $SERVICE_NAME"
-echo "  API URL:          http://127.0.0.1:$API_PORT"
+echo "  API (local):      http://127.0.0.1:$API_PORT"
+echo "  API bind host:    $API_BIND_HOST"
+echo "  KOI base URL:     $KOI_BASE_URL_DEFAULT"
 if [ -n "$NODE_RID" ]; then
   echo "  Node RID:         $NODE_RID"
 fi
@@ -404,12 +454,24 @@ if [ "${FEDERATION_DONE:-}" = "true" ]; then
   echo -e "${BOLD}────────────────── copy this ──────────────────${NC}"
   echo ""
   echo "  docker exec -i regen-koi-postgres psql -U postgres -d octo_koi <<'SQL'"
-  echo "  INSERT INTO koi_net_nodes (node_rid, node_name, node_type, base_url, status, last_seen)"
-  echo "    VALUES ('$NODE_RID', '$NODE_SLUG', 'FULL', 'http://$PUBLIC_IP:$API_PORT', 'active', now())"
-  echo "    ON CONFLICT (node_rid) DO NOTHING;"
+  echo "  INSERT INTO koi_net_nodes (node_rid, node_name, node_type, base_url, public_key, status, last_seen)"
+  echo "    VALUES ('$NODE_RID', '$NODE_SLUG', 'FULL', '$NODE_BASE_URL_FOR_COORD', $NODE_PUBLIC_KEY_SQL, 'active', now())"
+  echo "    ON CONFLICT (node_rid) DO UPDATE SET"
+  echo "      node_name = EXCLUDED.node_name,"
+  echo "      node_type = EXCLUDED.node_type,"
+  echo "      base_url = EXCLUDED.base_url,"
+  echo "      public_key = COALESCE(EXCLUDED.public_key, koi_net_nodes.public_key),"
+  echo "      status = 'active',"
+  echo "      last_seen = now();"
   echo "  INSERT INTO koi_net_edges (edge_rid, source_node, target_node, edge_type, status, rid_types)"
   echo "    VALUES ('$EDGE_RID', '$COORD_RID', '$NODE_RID', 'POLL', 'APPROVED', '$RID_TYPES')"
-  echo "    ON CONFLICT (edge_rid) DO NOTHING;"
+  echo "    ON CONFLICT (edge_rid) DO UPDATE SET"
+  echo "      source_node = EXCLUDED.source_node,"
+  echo "      target_node = EXCLUDED.target_node,"
+  echo "      edge_type = EXCLUDED.edge_type,"
+  echo "      status = 'APPROVED',"
+  echo "      rid_types = EXCLUDED.rid_types,"
+  echo "      updated_at = now();"
   echo "  SQL"
   echo ""
   echo -e "${BOLD}────────────────────────────────────────────────${NC}"
