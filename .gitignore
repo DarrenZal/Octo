@@ -27,6 +27,12 @@ credentials/
 # Backups
 backups/
 
+# OpenClaw fork (separate repo)
+openclaw/
+
+# Playwright MCP cache
+.playwright-mcp/
+
 # Claude Code session files
 **/CLAUDE.md
 !CLAUDE.md

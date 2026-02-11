@@ -44,6 +44,7 @@ from api.vault_parser import (
     get_entity_relationships,
     check_relationship_exists,
     SYMMETRIC_PREDICATES,
+    PREDICATE_TO_FIELD,
 )
 
 # Import web fetcher
@@ -64,6 +65,14 @@ from api.entity_schema import (
     get_phonetic_enabled_types,
     type_to_folder,
     EntityTypeConfig,
+)
+
+# Import LLM extraction layer
+from api.llm_enricher import (
+    extract_from_content,
+    describe_entities_batch,
+    is_enrichment_available,
+    ExtractionResult,
 )
 
 # Configure logging
@@ -94,17 +103,28 @@ EMBEDDING_MODEL = os.getenv('EMBEDDING_MODEL', 'text-embedding-ada-002')
 ENABLE_SEMANTIC_MATCHING = os.getenv('ENABLE_SEMANTIC_MATCHING', 'true').lower() == 'true'
 KOI_NET_ENABLED = os.getenv('KOI_NET_ENABLED', 'false').lower() == 'true'
 GITHUB_SENSOR_ENABLED = os.getenv('GITHUB_SENSOR_ENABLED', 'false').lower() == 'true'
+WEB_SENSOR_ENABLED = os.getenv('WEB_SENSOR_ENABLED', 'false').lower() == 'true'
+QUARTZ_BASE_URL = os.getenv('QUARTZ_BASE_URL', '').rstrip('/')
 
 # DEPRECATED: These are now loaded from vault schemas via entity_schema.py
 # Kept as fallback comments for reference
 # SEMANTIC_THRESHOLDS = loaded from schema.semantic_threshold
 # SIMILARITY_THRESHOLDS = loaded from schema.similarity_threshold
 
+def make_quartz_url(entity_name: str, entity_type: str) -> Optional[str]:
+    """Build a Quartz site URL for an entity page."""
+    if not QUARTZ_BASE_URL:
+        return None
+    folder = type_to_folder(entity_type)
+    slug = re.sub(r'[/\\]', '-', entity_name).replace(' ', '-')
+    return f"{QUARTZ_BASE_URL}/{folder}/{slug}"
+
 # Global connection pool
 db_pool: Optional[asyncpg.Pool] = None
 openai_available: bool = False
 openai_client: Optional[Any] = None
 github_sensor = None  # GitHubSensor instance (lazy import)
+web_sensor = None  # WebSensor instance (lazy import)
 
 
 # =============================================================================
@@ -149,6 +169,7 @@ class IngestRequest(BaseModel):
     relationships: List[ExtractedRelationship] = []
     source: str = "obsidian-vault"
     context: Optional[ResolutionContext] = None  # For contextual entity resolution
+    create_vault_notes: bool = False  # When true, create entity vault notes for new entities
 
 
 class CanonicalEntity(BaseModel):
@@ -893,12 +914,15 @@ async def store_new_entity(
         if phonetic_code:
             logger.info(f"Generated phonetic code for new {entity.type}: {entity.name} -> {phonetic_code}")
 
+    # Use context as description (when populated by LLM extraction layer)
+    description = entity.context if entity.context else None
+
     if embedding:
         await conn.execute("""
             INSERT INTO entity_registry (
                 fuseki_uri, entity_text, entity_type, normalized_text,
-                source, first_seen_rid, metadata, embedding, phonetic_code
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::vector, $9)
+                source, first_seen_rid, metadata, embedding, phonetic_code, description
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::vector, $9, $10)
             ON CONFLICT (fuseki_uri) DO NOTHING
         """,
             canonical.uri,
@@ -909,14 +933,15 @@ async def store_new_entity(
             document_rid,
             metadata,
             str(embedding),
-            phonetic_code
+            phonetic_code,
+            description
         )
     else:
         await conn.execute("""
             INSERT INTO entity_registry (
                 fuseki_uri, entity_text, entity_type, normalized_text,
-                source, first_seen_rid, metadata, phonetic_code
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)
+                source, first_seen_rid, metadata, phonetic_code, description
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9)
             ON CONFLICT (fuseki_uri) DO NOTHING
         """,
             canonical.uri,
@@ -926,7 +951,8 @@ async def store_new_entity(
             'personal-vault',
             document_rid,
             metadata,
-            phonetic_code
+            phonetic_code,
+            description
         )
 
 
@@ -999,6 +1025,17 @@ async def startup():
             except Exception as e:
                 logger.error(f"Failed to initialize GitHub sensor: {e}")
 
+        # Initialize Web sensor if enabled
+        if WEB_SENSOR_ENABLED:
+            try:
+                global web_sensor
+                from api.web_sensor import WebSensor
+                web_sensor = WebSensor(db_pool, event_queue=event_queue)
+                await web_sensor.start()
+                logger.info("Web sensor: ENABLED")
+            except Exception as e:
+                logger.error(f"Failed to initialize Web sensor: {e}")
+
     except Exception as e:
         logger.error(f"Failed to connect to database: {e}")
         raise
@@ -1007,12 +1044,17 @@ async def startup():
 @app.on_event("shutdown")
 async def shutdown():
     """Stop background tasks and close database connection pool"""
-    global db_pool, github_sensor
+    global db_pool, github_sensor, web_sensor
     if github_sensor:
         try:
             await github_sensor.stop()
         except Exception as e:
             logger.warning(f"GitHub sensor shutdown error: {e}")
+    if web_sensor:
+        try:
+            await web_sensor.stop()
+        except Exception as e:
+            logger.warning(f"Web sensor shutdown error: {e}")
     if KOI_NET_ENABLED:
         try:
             from api.koi_net_router import shutdown_koi_net
@@ -1466,6 +1508,8 @@ async def health_check():
             "entity_types": entity_types,
             "schema_version": get_schema_version(),
             "github_sensor": GITHUB_SENSOR_ENABLED and github_sensor is not None,
+            "web_sensor": WEB_SENSOR_ENABLED and web_sensor is not None,
+            "llm_enrichment": is_enrichment_available(),
             "resolution_tiers": {
                 "tier1_exact": True,
                 "tier1x_fuzzy": True,
@@ -1603,6 +1647,16 @@ async def ingest_extraction(request: IngestRequest):
                     logger.error(f"Error processing entity {entity.name}: {e}")
                     logger.error(traceback.format_exc())
                     # Continue with other entities
+
+    # Create vault notes for new entities if requested
+    if request.create_vault_notes:
+        async with db_pool.acquire() as conn:
+            for entity, canonical in zip(request.entities, canonical_entities):
+                if canonical.is_new:
+                    await _generate_entity_vault_note(
+                        conn, canonical.name, canonical.type, canonical.uri,
+                        description=entity.context,
+                    )
 
     # Generate receipt RID
     receipt_rid = f"orn:personal-koi.receipt:{uuid.uuid4().hex[:16]}"
@@ -1747,6 +1801,8 @@ class MentionedInDocument(BaseModel):
     mention_count: int
     doc_date: Optional[str] = None
     first_seen: str
+    source_url: Optional[str] = None
+    quartz_url: Optional[str] = None
 
 
 class MentionedInResponse(BaseModel):
@@ -1808,10 +1864,15 @@ async def get_entity_mentioned_in(
         raise HTTPException(status_code=503, detail="Database not available")
 
     async with db_pool.acquire() as conn:
-        # Query document_entity_links for documents mentioning this entity
+        # Query document_entity_links, joining web_submissions for source URLs
+        # document_rid uses "web:<rid>" format, web_submissions.rid is "<rid>"
         rows = await conn.fetch("""
-            SELECT del.document_rid, del.mention_count, del.created_at
+            SELECT del.document_rid, del.mention_count, del.created_at,
+                   ws.url AS source_url
             FROM document_entity_links del
+            LEFT JOIN web_submissions ws
+                ON ws.rid = REPLACE(del.document_rid, 'web:', '')
+                AND del.document_rid LIKE 'web:%'
             WHERE del.entity_uri = $1
             ORDER BY del.document_rid ASC
             LIMIT $2
@@ -1845,12 +1906,20 @@ async def get_entity_mentioned_in(
             # Extract date from filename if present
             doc_date = extract_date_from_vault_path(vault_path)
 
+            # Build Quartz URL for source documents
+            quartz_url = None
+            if QUARTZ_BASE_URL and vault_path:
+                slug = vault_path.replace(' ', '-').replace('/', '/')
+                quartz_url = f"{QUARTZ_BASE_URL}/{slug}"
+
             documents.append(MentionedInDocument(
                 vault_path=vault_path,
                 document_rid=doc_rid,
                 mention_count=row['mention_count'] or 1,
                 doc_date=doc_date,
-                first_seen=row['created_at'].isoformat() if row['created_at'] else None
+                first_seen=row['created_at'].isoformat() if row['created_at'] else None,
+                source_url=row['source_url'],
+                quartz_url=quartz_url,
             ))
 
         return MentionedInResponse(
@@ -1886,10 +1955,13 @@ async def get_entities_mentioned_in_batch(request: BatchMentionedInRequest):
 
     async with db_pool.acquire() as conn:
         for entity_uri in request.uris:
-            # Query for each entity
             rows = await conn.fetch("""
-                SELECT del.document_rid, del.mention_count, del.created_at
+                SELECT del.document_rid, del.mention_count, del.created_at,
+                       ws.url AS source_url
                 FROM document_entity_links del
+                LEFT JOIN web_submissions ws
+                    ON ws.rid = REPLACE(del.document_rid, 'web:', '')
+                    AND del.document_rid LIKE 'web:%'
                 WHERE del.entity_uri = $1
                 ORDER BY del.document_rid ASC
                 LIMIT $2
@@ -1903,8 +1975,6 @@ async def get_entities_mentioned_in_batch(request: BatchMentionedInRequest):
             for row in rows:
                 doc_rid = row['document_rid']
 
-                # Extract vault path from RID
-                # Handles various formats: orn:obsidian.entity:Notes/, vault:notes/, vault:
                 if doc_rid.startswith('orn:obsidian.entity:Notes/'):
                     vault_path = doc_rid.replace('orn:obsidian.entity:Notes/', '')
                 elif doc_rid.startswith('vault:notes/'):
@@ -1919,12 +1989,19 @@ async def get_entities_mentioned_in_batch(request: BatchMentionedInRequest):
 
                 doc_date = extract_date_from_vault_path(vault_path)
 
+                quartz_url = None
+                if QUARTZ_BASE_URL and vault_path:
+                    slug = vault_path.replace(' ', '-').replace('/', '/')
+                    quartz_url = f"{QUARTZ_BASE_URL}/{slug}"
+
                 documents.append(MentionedInDocument(
                     vault_path=vault_path,
                     document_rid=doc_rid,
                     mention_count=row['mention_count'] or 1,
                     doc_date=doc_date,
-                    first_seen=row['created_at'].isoformat() if row['created_at'] else None
+                    first_seen=row['created_at'].isoformat() if row['created_at'] else None,
+                    source_url=row['source_url'],
+                    quartz_url=quartz_url,
                 ))
 
             results[entity_uri] = MentionedInResponse(
@@ -3547,13 +3624,17 @@ async def entity_search(
             for row in rows:
                 if row["similarity"] < 0.3:
                     continue
-                results.append({
+                result = {
                     "uri": row["fuseki_uri"],
                     "name": row["entity_text"],
                     "type": row["entity_type"],
                     "similarity": round(float(row["similarity"]), 4),
                     "aliases": row["aliases"] or [],
-                })
+                }
+                qurl = make_quartz_url(row["entity_text"], row["entity_type"])
+                if qurl:
+                    result["quartz_url"] = qurl
+                results.append(result)
         else:
             search_method = "text"
             normalized = query.lower().strip()
@@ -3578,13 +3659,17 @@ async def entity_search(
                 )
 
             for row in rows:
-                results.append({
+                result = {
                     "uri": row["fuseki_uri"],
                     "name": row["entity_text"],
                     "type": row["entity_type"],
                     "similarity": round(float(row["sim"]), 4),
                     "aliases": row["aliases"] or [],
-                })
+                }
+                qurl = make_quartz_url(row["entity_text"], row["entity_type"])
+                if qurl:
+                    result["quartz_url"] = qurl
+                results.append(result)
 
         for r in results[:5]:
             count = await conn.fetchval(
@@ -3712,6 +3797,20 @@ class WebIngestRequest(BaseModel):
     vault_folder: str = "Sources"
 
 
+class WebProcessRequest(BaseModel):
+    """Extract entities and relationships from a previewed URL using LLM"""
+    url: str
+    hint_entities: List[str] = []
+    auto_ingest: bool = True  # Automatically ingest ALL extracted entities
+
+
+class EntityEnrichRequest(BaseModel):
+    """Backfill descriptions for existing entities"""
+    entity_uri: Optional[str] = None
+    entity_type: Optional[str] = None
+    limit: int = 50
+
+
 @app.post("/web/preview")
 async def web_preview(request: WebPreviewRequest):
     """Fetch a URL, extract content, scan for known entities.
@@ -3766,15 +3865,16 @@ async def web_preview(request: WebPreviewRequest):
             INSERT INTO web_submissions (
                 url, rid, domain, submitted_by, submitted_via, submission_message,
                 status, title, description, content_hash, word_count,
-                matching_entities, fetched_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, 'previewed', $7, $8, $9, $10, $11::jsonb, NOW())
+                matching_entities, content_text, fetched_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, 'previewed', $7, $8, $9, $10, $11::jsonb, $12, NOW())
             ON CONFLICT DO NOTHING
         """, request.url, preview.rid, preview.domain,
             request.submitted_by, request.submitted_via, request.submission_message,
             preview.title, preview.description, preview.content_hash, preview.word_count,
             json_module.dumps([e.to_dict() if hasattr(e, 'to_dict') else {
                 "name": e.name, "uri": e.uri, "type": e.entity_type, "context": e.match_context
-            } for e in preview.matching_entities]))
+            } for e in preview.matching_entities]),
+            preview.content_text)
 
     logger.info(f"Web preview: {request.url} -> {preview.title} ({preview.word_count} words, "
                 f"{len(preview.matching_entities)} entities)")
@@ -3819,6 +3919,219 @@ async def web_evaluate(request: WebEvaluateRequest):
         "relevance_score": request.relevance_score,
         "relevance_reasoning": request.relevance_reasoning,
         "bioregional_tags": request.bioregional_tags,
+    }
+
+
+@app.post("/web/process")
+async def web_process(request: WebProcessRequest):
+    """Extract entities, relationships, and descriptions from stored content using LLM.
+
+    This is the LLM extraction layer. Sits between /web/preview and /web/ingest.
+    Reads full content_text from web_submissions, calls Gemini to extract
+    structured data, returns entities + relationships ready for /web/ingest.
+    """
+    if not db_pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    if not is_enrichment_available():
+        raise HTTPException(
+            status_code=503,
+            detail="LLM enrichment not configured. Set LLM_ENRICHMENT_ENABLED=true and GEMINI_API_KEY."
+        )
+
+    async with db_pool.acquire() as conn:
+        submission = await conn.fetchrow(
+            "SELECT url, rid, title, description, content_text, status FROM web_submissions WHERE url = $1",
+            request.url,
+        )
+
+    if not submission:
+        raise HTTPException(status_code=404, detail="URL not found. Preview it first with /web/preview.")
+
+    content_text = submission["content_text"]
+    if not content_text:
+        # Re-fetch content if not stored
+        logger.info(f"No content_text for {request.url}, re-fetching...")
+        try:
+            preview = await fetch_and_preview(request.url)
+            content_text = preview.content_text
+            if content_text:
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE web_submissions SET content_text = $1 WHERE url = $2",
+                        content_text, request.url
+                    )
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No stored content and re-fetch failed: {e}"
+            )
+
+    # Get existing entities for matching context
+    existing_entities = []
+    if request.hint_entities:
+        existing_entities = [{"name": n} for n in request.hint_entities]
+    else:
+        # Fetch some known entities for context
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT entity_text AS name, entity_type AS type FROM entity_registry ORDER BY entity_text LIMIT 100"
+            )
+            existing_entities = [{"name": r["name"], "type": r["type"]} for r in rows]
+
+    # Call LLM extraction
+    result = await extract_from_content(
+        source_content=content_text,
+        source_title=submission["title"] or "",
+        source_url=request.url,
+        existing_entities=existing_entities,
+    )
+
+    logger.info(f"Web process: {request.url} -> {len(result.entities)} entities, "
+                f"{len(result.relationships)} relationships (model: {result.model_used})")
+
+    ingested_count = 0
+    new_entities = 0
+    new_relationships = 0
+    vault_notes_created = 0
+
+    # Auto-ingest: resolve, store, and create vault notes for ALL extracted entities
+    if request.auto_ingest and result.entities:
+        rid = submission["rid"]
+        document_rid = f"web:{rid}"
+
+        canonical_entities = []
+
+        # Transaction 1: Resolve and store ALL entities (isolated from relationships)
+        async with db_pool.acquire() as conn:
+            async with conn.transaction():
+                for extracted in result.entities:
+                    if not extracted.name.strip():
+                        continue
+                    try:
+                        # Build ExtractedEntity-compatible object for resolve_entity
+                        entity = ExtractedEntity(
+                            name=extracted.name,
+                            type=extracted.type,
+                            context=extracted.description,
+                        )
+                        canonical, is_new = await resolve_entity(conn, entity, None)
+                        canonical_entities.append((extracted, canonical, is_new))
+
+                        if is_new:
+                            await store_new_entity(conn, entity, canonical, document_rid)
+                            new_entities += 1
+
+                        # Always update description if we have one and entity lacks it
+                        if extracted.description:
+                            await conn.execute(
+                                """UPDATE entity_registry SET description = $1
+                                   WHERE fuseki_uri = $2 AND (description IS NULL OR description = '')""",
+                                extracted.description, canonical.uri
+                            )
+
+                        # Link entity to document
+                        await conn.execute("""
+                            INSERT INTO document_entity_links (document_rid, entity_uri, context)
+                            VALUES ($1, $2, $3)
+                            ON CONFLICT (document_rid, entity_uri)
+                            DO UPDATE SET mention_count = document_entity_links.mention_count + 1
+                        """, document_rid, canonical.uri, extracted.description)
+
+                        ingested_count += 1
+                    except Exception as e:
+                        logger.warning(f"Failed to ingest extracted entity {extracted.name}: {e}")
+
+        # Build name→canonical map for relationship resolution
+        name_to_canonical = {}
+        for extracted, canonical, is_new in canonical_entities:
+            name_to_canonical[extracted.name.lower().strip()] = canonical
+
+        # Transaction 2: Store relationships individually (each in its own savepoint)
+        async with db_pool.acquire() as conn:
+            for rel in result.relationships:
+                subj = name_to_canonical.get(rel.subject.lower().strip())
+                obj = name_to_canonical.get(rel.object.lower().strip())
+                if not subj or not obj:
+                    continue
+                # Skip self-referencing relationships
+                if subj.uri == obj.uri:
+                    logger.debug(f"Skipping self-referencing relationship: {rel.subject} -> {rel.predicate} -> {rel.object}")
+                    continue
+                try:
+                    async with conn.transaction():
+                        exists = await check_relationship_exists(
+                            conn, subj.uri, rel.predicate, obj.uri
+                        )
+                        if not exists:
+                            await conn.execute("""
+                                INSERT INTO entity_relationships
+                                    (subject_uri, predicate, object_uri, confidence, source, source_rid)
+                                VALUES ($1, $2, $3, $4, 'web', $5)
+                                ON CONFLICT (subject_uri, predicate, object_uri) DO NOTHING
+                            """, subj.uri, rel.predicate, obj.uri, rel.confidence, document_rid)
+                            new_relationships += 1
+                except Exception as e:
+                    logger.warning(f"Failed to store relationship {rel.subject} -> {rel.predicate} -> {rel.object}: {e}")
+
+        # Generate vault notes for ALL entities (new = create, existing = update)
+        async with db_pool.acquire() as conn:
+            for extracted, canonical, is_new in canonical_entities:
+                try:
+                    await _generate_entity_vault_note(
+                        conn, canonical.name, canonical.type, canonical.uri,
+                        description=extracted.description,
+                        overwrite=is_new,  # Overwrite if new (may have stale stub)
+                    )
+                    if is_new:
+                        vault_notes_created += 1
+                except Exception as e:
+                    logger.warning(f"Failed to create vault note for {canonical.name}: {e}")
+
+        # Update submission status
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE web_submissions SET status = 'ingested', ingested_at = NOW() WHERE url = $1 AND status != 'monitoring'",
+                request.url
+            )
+
+        logger.info(f"Auto-ingest: {ingested_count} entities ({new_entities} new), "
+                    f"{new_relationships} relationships, {vault_notes_created} vault notes")
+
+    # Format response
+    return {
+        "url": request.url,
+        "title": submission["title"],
+        "summary": result.summary,
+        "topics": result.topics,
+        "model_used": result.model_used,
+        "entities": [
+            {
+                "name": e.name,
+                "type": e.type,
+                "description": e.description,
+                "fields": e.fields,
+                "confidence": e.confidence,
+                "context": e.description,
+            }
+            for e in result.entities
+        ],
+        "relationships": [
+            {
+                "subject": r.subject,
+                "predicate": r.predicate,
+                "object": r.object,
+                "confidence": r.confidence,
+            }
+            for r in result.relationships
+        ],
+        "ingestion": {
+            "auto_ingested": request.auto_ingest,
+            "entities_resolved": ingested_count,
+            "new_entities": new_entities,
+            "new_relationships": new_relationships,
+            "vault_notes_created": vault_notes_created,
+        } if request.auto_ingest else None,
     }
 
 
@@ -3915,12 +4228,19 @@ async def web_ingest(request: WebIngestRequest):
 
     # Create vault notes for newly discovered entities
     source_note_name = vault_path.replace(".md", "")  # e.g. "Sources/SalishSeaio"
-    for entity, canonical in zip(request.entities, canonical_entities):
-        if canonical.is_new:
-            _create_entity_vault_note(
-                canonical.name, canonical.type, canonical.uri,
-                source_note_name, entity.context,
-            )
+
+    # Build a map of entity name → canonical for relationship lookup
+    name_to_canonical = {}
+    for ce in canonical_entities:
+        name_to_canonical[ce.name.lower()] = ce
+
+    async with db_pool.acquire() as conn:
+        for entity, canonical in zip(request.entities, canonical_entities):
+            if canonical.is_new:
+                await _generate_entity_vault_note(
+                    conn, canonical.name, canonical.type, canonical.uri,
+                    description=entity.context,
+                )
 
     # Update submission record
     import json as json_module
@@ -4054,19 +4374,24 @@ def _generate_source_vault_note(
     return rel_path
 
 
-def _create_entity_vault_note(
+async def _generate_entity_vault_note(
+    conn,
     entity_name: str,
     entity_type: str,
     entity_uri: str,
-    source_note: str,
-    context: str = None,
+    description: str = None,
+    overwrite: bool = False,
 ) -> Optional[str]:
-    """Create a vault note for a newly discovered entity.
+    """Generate a vault note for an entity using full DB state.
 
-    Follows the personal-koi-mcp entity note conventions:
-    - @type, name, uri in frontmatter
-    - mentionedIn array for bidirectional linking
-    - Don't overwrite existing notes
+    Pulls ALL relationships (outgoing + incoming) and ALL mentionedIn links
+    from the database to produce a complete, rich vault note.
+
+    Generates notes with:
+    - YAML frontmatter: @type, name, description, relationship fields, uri, mentionedIn
+    - Wikilinks in frontmatter arrays (for vault_parser.py)
+    - ## Relationships body section with wikilinks (for Quartz graph view)
+    - Description as body paragraph
     """
     folder = type_to_folder(entity_type)
     safe_name = entity_name.replace("/", "-").replace("\\", "-")
@@ -4075,40 +4400,458 @@ def _create_entity_vault_note(
     vault_base = os.getenv("VAULT_PATH", "/root/.openclaw/workspace/vault")
     full_path = os.path.join(vault_base, rel_path)
 
-    if os.path.exists(full_path):
+    if os.path.exists(full_path) and not overwrite:
         return rel_path
 
     os.makedirs(os.path.dirname(full_path), exist_ok=True)
 
-    # Map @type to match skill conventions
-    SCHEMA_PREFIX_TYPES = {
-        "Person": '"schema:Person"',
-        "Organization": '"schema:Organization"',
-        "Location": '"schema:Place"',
-    }
-    at_type = SCHEMA_PREFIX_TYPES.get(entity_type, entity_type)
+    # --- Fetch ALL relationships from DB ---
+    # Outgoing: this entity is the subject
+    outgoing = await conn.fetch(
+        """SELECT er2.predicate, t.entity_text as target_text, t.entity_type as target_type
+           FROM entity_relationships er2
+           JOIN entity_registry t ON t.fuseki_uri = er2.object_uri
+           WHERE er2.subject_uri = $1""",
+        entity_uri
+    )
+    # Incoming: this entity is the object
+    incoming = await conn.fetch(
+        """SELECT er2.predicate, s.entity_text as source_text, s.entity_type as source_type
+           FROM entity_relationships er2
+           JOIN entity_registry s ON s.fuseki_uri = er2.subject_uri
+           WHERE er2.object_uri = $1""",
+        entity_uri
+    )
 
+    # --- Fetch ALL mentionedIn from DB ---
+    doc_links = await conn.fetch(
+        """SELECT del.document_rid, ws.title, ws.vault_note_path
+           FROM document_entity_links del
+           LEFT JOIN web_submissions ws ON ws.rid = REPLACE(del.document_rid, 'web:', '')
+           WHERE del.entity_uri = $1""",
+        entity_uri
+    )
+
+    # --- Map @type ---
+    SCHEMA_PREFIX_TYPES = {"Person": "schema:Person", "Organization": "schema:Organization", "Location": "schema:Place"}
+    BKC_PREFIX_TYPES = {"Practice", "Pattern", "CaseStudy", "Bioregion", "Protocol", "Playbook", "Question", "Claim", "Evidence"}
+    if entity_type in SCHEMA_PREFIX_TYPES:
+        at_type = f'"{SCHEMA_PREFIX_TYPES[entity_type]}"'
+    elif entity_type in BKC_PREFIX_TYPES:
+        at_type = f'"bkc:{entity_type}"'
+    else:
+        at_type = entity_type
+
+    # --- Build frontmatter ---
     lines = [
         "---",
         f'"@type": {at_type}',
         f'name: "{entity_name}"',
-        f'uri: "{entity_uri}"',
-        "mentionedIn:",
-        f'  - "[[{source_note}]]"',
-        "---",
-        "",
-        f"# {entity_name}",
-        "",
     ]
-    if context:
-        lines.append(context)
+
+    if description:
+        safe_desc = description.replace('"', '\\"')
+        lines.append(f'description: "{safe_desc}"')
+
+    # Group relationships by YAML field name (deduped)
+    rel_fields: Dict[str, list] = {}  # field_name -> [wikilinks]
+    body_rels = []  # (predicate_display, wikilink)
+
+    for rel in outgoing:
+        field_name = PREDICATE_TO_FIELD.get(rel["predicate"], rel["predicate"])
+        target_folder = type_to_folder(rel["target_type"])
+        wikilink = f'[[{target_folder}/{rel["target_text"]}]]'
+        pred_display = rel["predicate"].replace("_", " ")
+
+        rel_fields.setdefault(field_name, [])
+        if wikilink not in rel_fields[field_name]:
+            rel_fields[field_name].append(wikilink)
+        body_rels.append((pred_display, wikilink))
+
+    for rel in incoming:
+        field_name = PREDICATE_TO_FIELD.get(rel["predicate"], rel["predicate"])
+        source_folder = type_to_folder(rel["source_type"])
+        wikilink = f'[[{source_folder}/{rel["source_text"]}]]'
+        pred_display = rel["predicate"].replace("_", " ")
+
+        rel_fields.setdefault(field_name, [])
+        if wikilink not in rel_fields[field_name]:
+            rel_fields[field_name].append(wikilink)
+        body_rels.append((f"{pred_display} (from)", wikilink))
+
+    # Write relationship fields to frontmatter
+    for field_name, wikilinks in sorted(rel_fields.items()):
+        lines.append(f"{field_name}:")
+        for wl in sorted(set(wikilinks)):
+            lines.append(f'  - "{wl}"')
+
+    lines.append(f'uri: "{entity_uri}"')
+
+    # mentionedIn (sorted, deduped)
+    mentioned = []
+    for doc in doc_links:
+        doc_rid = doc["document_rid"]
+        # Web sources: use vault_note_path from web_submissions (matches actual filename)
+        if doc_rid.startswith("web:") and doc["vault_note_path"]:
+            vpath = doc["vault_note_path"]
+            if vpath.endswith(".md"):
+                vpath = vpath[:-3]
+            mentioned.append(f"[[{vpath}]]")
+        elif doc_rid.startswith("vault:"):
+            # Vault documents: strip prefix and .md extension
+            vpath = doc_rid.replace("vault:", "")
+            if vpath.endswith(".md"):
+                vpath = vpath[:-3]
+            mentioned.append(f"[[{vpath}]]")
+        elif doc_rid.startswith("github:"):
+            # GitHub documents: not in vault, skip for now
+            continue
+        else:
+            mentioned.append(f"[[{doc_rid}]]")
+    if mentioned:
+        lines.append("mentionedIn:")
+        for m in sorted(set(mentioned)):
+            lines.append(f'  - "{m}"')
+
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# {entity_name}")
+    lines.append("")
+
+    # Body: description
+    if description:
+        lines.append(description)
+        lines.append("")
+
+    # Body: relationships section (for Quartz graph rendering)
+    if body_rels:
+        lines.append("## Relationships")
+        lines.append("")
+        seen = set()
+        for pred_display, wikilink in body_rels:
+            key = f"{pred_display}:{wikilink}"
+            if key not in seen:
+                seen.add(key)
+                lines.append(f"- {pred_display}: {wikilink}")
+        lines.append("")
+
+    # Body: mentioned in section (visible on Quartz pages)
+    if mentioned:
+        lines.append("## Mentioned In")
+        lines.append("")
+        for m in sorted(set(mentioned)):
+            lines.append(f"- {m}")
         lines.append("")
 
     with open(full_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
-    logger.info(f"Created entity vault note: {rel_path}")
+    logger.info(f"{'Regenerated' if overwrite else 'Created'} vault note: {rel_path}")
     return rel_path
+
+
+# =============================================================================
+# Entity Enrichment Endpoint (LLM backfill)
+# =============================================================================
+
+@app.post("/entity/enrich")
+async def entity_enrich(request: EntityEnrichRequest):
+    """Backfill descriptions for existing entities using LLM extraction.
+
+    Finds entities without descriptions, looks up their source content,
+    and uses LLM to extract descriptions. Groups by source URL for efficiency.
+    """
+    if not db_pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    if not is_enrichment_available():
+        raise HTTPException(
+            status_code=503,
+            detail="LLM enrichment not configured. Set LLM_ENRICHMENT_ENABLED=true and GEMINI_API_KEY."
+        )
+
+    async with db_pool.acquire() as conn:
+        # Find entities without descriptions
+        query = """
+            SELECT er.fuseki_uri, er.entity_text, er.entity_type,
+                   del.document_rid, ws.url, ws.title, ws.content_text
+            FROM entity_registry er
+            LEFT JOIN document_entity_links del ON del.entity_uri = er.fuseki_uri
+            LEFT JOIN web_submissions ws ON ws.rid = REPLACE(del.document_rid, 'web:', '')
+            WHERE er.description IS NULL
+        """
+        params = []
+        param_idx = 1
+
+        if request.entity_uri:
+            query += f" AND er.fuseki_uri = ${param_idx}"
+            params.append(request.entity_uri)
+            param_idx += 1
+        if request.entity_type:
+            query += f" AND er.entity_type = ${param_idx}"
+            params.append(request.entity_type)
+            param_idx += 1
+
+        query += f" ORDER BY er.entity_type, er.entity_text LIMIT ${param_idx}"
+        params.append(request.limit)
+
+        rows = await conn.fetch(query, *params)
+
+    if not rows:
+        return {"enriched": 0, "message": "No entities need enrichment"}
+
+    # Group by source URL for batched LLM calls
+    by_source: Dict[str, List[Any]] = {}
+    for row in rows:
+        url = row["url"] or "no_source"
+        if url not in by_source:
+            by_source[url] = []
+        by_source[url].append(row)
+
+    enriched_count = 0
+    errors = []
+
+    for source_url, entities in by_source.items():
+        content_text = entities[0]["content_text"] if entities[0]["content_text"] else None
+        title = entities[0]["title"] or ""
+
+        if not content_text and source_url != "no_source":
+            # Re-fetch the URL to get content
+            logger.info(f"No content_text for {source_url}, re-fetching...")
+            try:
+                preview = await fetch_and_preview(source_url)
+                content_text = preview.content_text
+                title = title or preview.title or ""
+                # Store the content for future use
+                if content_text:
+                    async with db_pool.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE web_submissions SET content_text = $1 WHERE url = $2",
+                            content_text, source_url
+                        )
+                        logger.info(f"Stored {len(content_text)} chars of content_text for {source_url}")
+            except Exception as e:
+                logger.warning(f"Failed to re-fetch {source_url}: {e}")
+
+        if not content_text:
+            logger.info(f"No content available for source {source_url}, skipping {len(entities)} entities")
+            continue
+
+        # Extract from this source
+        try:
+            result = await extract_from_content(
+                source_content=content_text,
+                source_title=title,
+                source_url=source_url if source_url != "no_source" else "",
+            )
+        except Exception as e:
+            errors.append(f"Extraction failed for {source_url}: {e}")
+            continue
+
+        # Match extracted descriptions back to entities (exact + fuzzy)
+        extracted_by_name = {e.name.lower().strip(): e for e in result.entities}
+
+        async with db_pool.acquire() as conn:
+            for row in entities:
+                entity_name = row["entity_text"]
+                # Exact match first
+                extracted = extracted_by_name.get(entity_name.lower().strip())
+                # Fuzzy match if no exact match
+                if not extracted:
+                    from rapidfuzz import fuzz
+                    best_score, best_match = 0, None
+                    for ext_name, ext_entity in extracted_by_name.items():
+                        score = fuzz.ratio(entity_name.lower(), ext_name)
+                        if score > best_score:
+                            best_score = score
+                            best_match = ext_entity
+                    if best_score >= 80:
+                        extracted = best_match
+                        logger.info(f"Fuzzy matched '{entity_name}' → '{best_match.name}' (score={best_score})")
+
+                if extracted and extracted.description:
+                    await conn.execute(
+                        "UPDATE entity_registry SET description = $1 WHERE fuseki_uri = $2",
+                        extracted.description, row["fuseki_uri"]
+                    )
+                    enriched_count += 1
+                    logger.info(f"Enriched: {entity_name} ({row['entity_type']})")
+
+    return {
+        "enriched": enriched_count,
+        "total_checked": len(rows),
+        "sources_processed": len(by_source),
+        "errors": errors if errors else None,
+    }
+
+
+class EntityDescribeRequest(BaseModel):
+    """Request for batch entity description generation."""
+    entity_type: Optional[str] = None  # Filter by type
+    limit: int = 30  # Batch size (Gemini handles ~30 well per call)
+    regenerate_notes: bool = True  # Also regenerate vault notes
+
+
+@app.post("/entity/describe")
+async def entity_describe(request: EntityDescribeRequest):
+    """Generate descriptions for entities using LLM, based on name + type + relationships.
+
+    Unlike /entity/enrich which requires web source content, this endpoint uses
+    Gemini's training knowledge plus entity relationships to write descriptions.
+    Works for vault-seeded entities that have no web source.
+    """
+    if not db_pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    if not is_enrichment_available():
+        raise HTTPException(
+            status_code=503,
+            detail="LLM enrichment not configured. Set LLM_ENRICHMENT_ENABLED=true and GEMINI_API_KEY."
+        )
+
+    async with db_pool.acquire() as conn:
+        # Find entities without descriptions
+        query = """
+            SELECT er.fuseki_uri, er.entity_text, er.entity_type
+            FROM entity_registry er
+            WHERE er.description IS NULL
+        """
+        params = []
+        param_idx = 1
+
+        if request.entity_type:
+            query += f" AND er.entity_type = ${param_idx}"
+            params.append(request.entity_type)
+            param_idx += 1
+
+        query += f" ORDER BY er.entity_type, er.entity_text LIMIT ${param_idx}"
+        params.append(request.limit)
+
+        rows = await conn.fetch(query, *params)
+
+    if not rows:
+        return {"described": 0, "message": "No entities need descriptions"}
+
+    # Get relationships for each entity
+    entity_batch = []
+    entity_map = {}  # name → fuseki_uri
+    for row in rows:
+        rels = []
+        if db_pool:
+            async with db_pool.acquire() as conn:
+                rel_rows = await conn.fetch(
+                    """SELECT er2.predicate, er.entity_text as target_text
+                       FROM entity_relationships er2
+                       JOIN entity_registry er ON er.fuseki_uri = er2.object_uri
+                       WHERE er2.subject_uri = $1 LIMIT 10""",
+                    row["fuseki_uri"]
+                )
+                rels = [f"{r['predicate']}: {r['target_text']}" for r in rel_rows]
+
+        entity_batch.append({
+            "name": row["entity_text"],
+            "type": row["entity_type"],
+            "relationships": rels,
+        })
+        entity_map[row["entity_text"].lower().strip()] = row["fuseki_uri"]
+
+    # Call LLM for batch descriptions
+    descriptions = await describe_entities_batch(entity_batch)
+
+    # Store descriptions
+    described_count = 0
+    async with db_pool.acquire() as conn:
+        for name, desc in descriptions.items():
+            if not desc or not desc.strip():
+                continue
+            uri = entity_map.get(name.lower().strip())
+            if not uri:
+                # Try fuzzy match
+                from rapidfuzz import fuzz
+                best_score, best_uri = 0, None
+                for db_name, db_uri in entity_map.items():
+                    score = fuzz.ratio(name.lower(), db_name)
+                    if score > best_score:
+                        best_score = score
+                        best_uri = db_uri
+                if best_score >= 80:
+                    uri = best_uri
+
+            if uri:
+                await conn.execute(
+                    "UPDATE entity_registry SET description = $1 WHERE fuseki_uri = $2",
+                    desc.strip(), uri
+                )
+                described_count += 1
+                logger.info(f"Described: {name}")
+
+    # Regenerate vault notes if requested
+    regenerated = 0
+    if request.regenerate_notes and described_count > 0:
+        async with db_pool.acquire() as conn:
+            for name, desc in descriptions.items():
+                uri = entity_map.get(name.lower().strip())
+                if not uri:
+                    continue
+                row = await conn.fetchrow(
+                    "SELECT entity_text, entity_type, description FROM entity_registry WHERE fuseki_uri = $1",
+                    uri
+                )
+                if row:
+                    try:
+                        await _generate_entity_vault_note(conn, row["entity_text"], row["entity_type"], uri, description=row["description"], overwrite=True)
+                        regenerated += 1
+                    except Exception as e:
+                        logger.warning(f"Failed to regenerate note for {name}: {e}")
+
+    return {
+        "described": described_count,
+        "total_checked": len(rows),
+        "notes_regenerated": regenerated,
+    }
+
+
+@app.post("/vault/regenerate")
+async def vault_regenerate_all(entity_type: Optional[str] = None, limit: int = 500):
+    """Regenerate ALL vault notes from current DB state.
+
+    Pulls complete relationships, descriptions, and mentionedIn from the database
+    and overwrites existing vault notes. Useful after bulk ingestion or schema changes.
+    """
+    if not db_pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    query = "SELECT fuseki_uri, entity_text, entity_type, description FROM entity_registry"
+    params = []
+    if entity_type:
+        query += " WHERE entity_type = $1"
+        params.append(entity_type)
+    query += f" ORDER BY entity_text LIMIT {limit}"
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(query, *params)
+
+    regenerated = 0
+    errors = 0
+    async with db_pool.acquire() as conn:
+        for row in rows:
+            try:
+                await _generate_entity_vault_note(
+                    conn, row["entity_text"], row["entity_type"], row["fuseki_uri"],
+                    description=row["description"],
+                    overwrite=True,
+                )
+                regenerated += 1
+            except Exception as e:
+                logger.warning(f"Failed to regenerate {row['entity_text']}: {e}")
+                errors += 1
+
+    return {
+        "regenerated": regenerated,
+        "errors": errors,
+        "total": len(rows),
+        "entity_type_filter": entity_type,
+    }
 
 
 # =============================================================================
@@ -4226,6 +4969,48 @@ async def code_graph_query(request: CodeQueryRequest):
         return {"results": results, "count": len(results)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# Web Sensor Endpoints
+# =============================================================================
+
+class WebMonitorRequest(BaseModel):
+    url: str
+    title: str = ""
+
+
+@app.get("/web/monitor/status")
+async def web_monitor_status():
+    """Get web sensor monitoring status."""
+    if not web_sensor:
+        return {"enabled": False, "message": "Web sensor not enabled. Set WEB_SENSOR_ENABLED=true."}
+    return await web_sensor.get_status()
+
+
+@app.post("/web/monitor/add")
+async def web_monitor_add(request: WebMonitorRequest):
+    """Add a URL to the monitoring list."""
+    if not web_sensor:
+        raise HTTPException(status_code=503, detail="Web sensor not enabled")
+    return await web_sensor.add_url(request.url, request.title)
+
+
+@app.post("/web/monitor/remove")
+async def web_monitor_remove(request: WebMonitorRequest):
+    """Remove a URL from monitoring."""
+    if not web_sensor:
+        raise HTTPException(status_code=503, detail="Web sensor not enabled")
+    return await web_sensor.remove_url(request.url)
+
+
+@app.post("/web/monitor/scan")
+async def web_monitor_trigger_scan():
+    """Manually trigger a scan of all monitored URLs."""
+    if not web_sensor:
+        raise HTTPException(status_code=503, detail="Web sensor not enabled")
+    asyncio.create_task(web_sensor._check_all_sources())
+    return {"status": "scan_triggered"}
 
 
 if __name__ == "__main__":

@@ -291,6 +291,37 @@ const bioregionalKoiPlugin = {
       { names: ["preview_url"] },
     );
 
+    // process_url — extract entities/relationships from previewed URL using LLM
+    api.registerTool(
+      {
+        name: "process_url",
+        description:
+          "Extract entities, relationships, and descriptions from a previewed URL using server-side LLM. Call AFTER preview_url and BEFORE ingest_url. Returns structured extraction with descriptions that make vault notes richer.",
+        parameters: {
+          type: "object",
+          properties: {
+            url: { type: "string", description: "The URL to process (must have been previewed first)" },
+            hint_entities: {
+              type: "array",
+              description: "Optional: entity names you already spotted to help the LLM match",
+              items: { type: "string" },
+            },
+          },
+          required: ["url"],
+        },
+        async execute(_id: string, params: Record<string, unknown>) {
+          const url = params.url as string;
+          const hint_entities = (params.hint_entities as string[]) || [];
+          const data = await koiRequest("/web/process", "POST", {
+            url,
+            hint_entities,
+          });
+          return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+        },
+      },
+      { names: ["process_url"] },
+    );
+
     // ingest_url — ingest a previously previewed URL
     api.registerTool(
       {
@@ -377,6 +408,51 @@ const bioregionalKoiPlugin = {
         },
       },
       { names: ["github_scan"] },
+    );
+
+    // monitor_url — add/remove/check web source monitoring
+    api.registerTool(
+      {
+        name: "monitor_url",
+        description:
+          "Manage web source monitoring. Add URLs to be periodically checked for content changes, which triggers re-extraction of entities and relationships. Use to keep the knowledge graph up to date with external sources.",
+        parameters: {
+          type: "object",
+          properties: {
+            action: {
+              type: "string",
+              description: "Action: 'add' to start monitoring, 'remove' to stop, 'status' to check (default: status)",
+            },
+            url: {
+              type: "string",
+              description: "URL to add/remove from monitoring",
+            },
+            title: {
+              type: "string",
+              description: "Optional title for the source (used when adding)",
+            },
+          },
+        },
+        async execute(_id: string, params: Record<string, unknown>) {
+          const action = (params.action as string) || "status";
+          if (action === "add") {
+            const data = await koiRequest("/web/monitor/add", "POST", {
+              url: params.url,
+              title: params.title || "",
+            });
+            return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+          }
+          if (action === "remove") {
+            const data = await koiRequest("/web/monitor/remove", "POST", {
+              url: params.url,
+            });
+            return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+          }
+          const data = await koiRequest("/web/monitor/status");
+          return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+        },
+      },
+      { names: ["monitor_url"] },
     );
 
     // code_query — run Cypher queries against the code graph

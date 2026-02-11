@@ -119,6 +119,38 @@ FIELD_TO_PREDICATE: Dict[str, Tuple[str, str, Optional[str]]] = {
 # Symmetric predicates: when A knows B, also create B knows A
 SYMMETRIC_PREDICATES = {'knows', 'collaborates_with'}
 
+# Reverse mapping: predicate → preferred YAML field name for vault note generation
+# Picks the most natural/readable field name for each predicate
+PREDICATE_TO_FIELD: Dict[str, str] = {
+    'affiliated_with': 'affiliation',
+    'founded': 'founder',
+    'has_founder': 'founders',
+    'knows': 'knows',
+    'collaborates_with': 'collaborators',
+    'involves_person': 'people',
+    'has_project': 'projects',
+    'attended': 'attendees',
+    'located_in': 'location',
+    'involves_organization': 'parentOrg',
+    'aggregates_into': 'patterns',
+    'suggests': 'suggests',
+    'practiced_in': 'bioregion',
+    'documents': 'documents',
+    'supports': 'supports',
+    'opposes': 'opposes',
+    'informs': 'informs',
+    'generates': 'generates',
+    'implemented_by': 'implementedBy',
+    'synthesizes': 'synthesizes',
+    'about': 'about',
+    'broader': 'broader',
+    'narrower': 'narrower',
+    'related_to': 'relatedTo',
+    'forked_from': 'forkedFrom',
+    'builds_on': 'buildsOn',
+    'inspired_by': 'inspiredBy',
+}
+
 
 # =============================================================================
 # Wikilink Parsing

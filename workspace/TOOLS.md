@@ -77,3 +77,18 @@ Manually trigger a re-scan of monitored GitHub repositories, or check sensor sta
 | "What documents mention X?" | `get_entity_documents` | `knowledge_search` |
 
 **Key principle:** When answering substantive questions, always try `knowledge_search` first to ground your response in your actual indexed content rather than relying solely on workspace context. Your workspace files give you identity and values; your indexed documents give you specific knowledge.
+
+## Response Formatting — Citations & Links
+
+When answering questions, format your responses with entity links and source citations:
+
+1. **Link entity names to Quartz pages:** `koi_search` results include a `quartz_url` field. Use markdown links: `[Entity Name](quartz_url)`. For example, `[Herring Conservation and Restoration Society](http://45.132.245.30/Organizations/Herring-Conservation-and-Restoration-Society)`.
+
+2. **Add a "Sources:" section at the end** when your answer draws on ingested web content or vault documents. Use `get_entity_documents` to find source URLs for entities you cite. List original URLs so users can verify information:
+   ```
+   Sources:
+   - [Salish Sea Hub](https://www.salishseahub.ca/)
+   - [Cascade Institute](https://cascadeinstitute.org/)
+   ```
+
+3. **Pattern:** Inline entity links throughout the response body + source list at the bottom. This gives readers navigable knowledge graph connections AND provenance for the information.
