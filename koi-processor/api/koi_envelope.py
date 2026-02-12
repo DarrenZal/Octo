@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import json
 import os
-import hashlib
 from base64 import b64decode, b64encode
 from typing import Any, Dict, Optional, Tuple
 
@@ -130,57 +129,6 @@ def public_key_to_der_b64(public_key) -> str:
         format=serialization.PublicFormat.SubjectPublicKeyInfo,
     )
     return b64encode(der_bytes).decode()
-
-
-def public_key_der_sha256_hex(public_key) -> str:
-    """Hash DER-encoded public key bytes with SHA256 (full hex digest)."""
-    der_bytes = public_key.public_bytes(
-        encoding=serialization.Encoding.DER,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo,
-    )
-    return hashlib.sha256(der_bytes).hexdigest()
-
-
-def public_key_legacy_sha256_suffix(public_key) -> str:
-    """Legacy Octo hash suffix: sha256(base64(der_pubkey))[:16]."""
-    der_b64 = public_key_to_der_b64(public_key)
-    return hashlib.sha256(der_b64.encode()).hexdigest()[:16]
-
-
-def node_rid_suffix(node_rid: str) -> str:
-    """Return RID suffix after '+', or empty string if malformed."""
-    if "+" not in node_rid:
-        return ""
-    return node_rid.rsplit("+", 1)[-1]
-
-
-def node_rid_matches_public_key(
-    node_rid: str,
-    public_key,
-    allow_legacy16: bool = True,
-    allow_der64: bool = True,
-) -> bool:
-    """Check whether a node RID suffix matches an expected public-key hash.
-
-    Supported suffixes:
-    - 16-char legacy: sha256(base64(der_pubkey))[:16]
-    - 64-char canonical: sha256(der_pubkey)
-    """
-    suffix = node_rid_suffix(node_rid)
-    if not suffix:
-        return False
-
-    if len(suffix) == 16:
-        if not allow_legacy16:
-            return False
-        return suffix == public_key_legacy_sha256_suffix(public_key)
-
-    if len(suffix) == 64:
-        if not allow_der64:
-            return False
-        return suffix == public_key_der_sha256_hex(public_key)
-
-    return False
 
 
 # =============================================================================
