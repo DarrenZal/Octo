@@ -171,6 +171,8 @@ See [ontology/bkc-ontology.jsonld](ontology/bkc-ontology.jsonld) for the formal 
 │   ├── koi-api.service     # Octo (port 8351)
 │   └── gv-koi-api.service  # Greater Victoria (port 8352)
 └── docs/                   # Strategy and implementation plans
+    ├── join-the-network.md
+    ├── koi-alignment.md
     ├── holonic-bioregional-knowledge-commons.md
     ├── ontological-architecture.md
     └── implementation-plan.md
@@ -228,6 +230,17 @@ Federation readiness checklist (critical):
 - Ensure each peer's `public_key` is present in `koi_net_nodes` on the other side.
 - Use `POST /koi-net/events/poll` (legacy `POST /koi-net/poll` is not supported).
 - Prefer `bash scripts/connect-koi-peer.sh --db <db> --peer-url <url>` for idempotent local setup.
+- Keep strict validation disabled during bootstrap:
+  - `KOI_STRICT_MODE=false`
+  - `KOI_REQUIRE_SIGNED_ENVELOPES=false`
+  - `KOI_REQUIRE_SIGNED_RESPONSES=false`
+  - `KOI_ENFORCE_TARGET_MATCH=false`
+  - `KOI_ENFORCE_SOURCE_KEY_RID_BINDING=false`
+- Enable strict mode only after peer coordination confirms signed-envelope compatibility.
+
+KOI endpoint model:
+- Core protocol endpoints: `/koi-net/events/broadcast`, `/koi-net/events/poll`, `/koi-net/manifests/fetch`, `/koi-net/bundles/fetch`, `/koi-net/rids/fetch`
+- Octo extensions: `/koi-net/handshake`, `/koi-net/events/confirm`, `/koi-net/health`
 
 Quick federation sanity checks:
 ```bash

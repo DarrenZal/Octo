@@ -37,6 +37,23 @@ DEFAULT_POLL_INTERVAL = int(os.getenv("KOI_POLL_INTERVAL", "60"))
 MAX_BACKOFF = 600  # 10 minutes
 
 
+def _bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+REQUIRE_SIGNED_REQUESTS = _bool_env(
+    "KOI_REQUIRE_SIGNED_ENVELOPES",
+    _bool_env("KOI_STRICT_MODE", False),
+)
+REQUIRE_SIGNED_RESPONSES = _bool_env(
+    "KOI_REQUIRE_SIGNED_RESPONSES",
+    _bool_env("KOI_STRICT_MODE", False),
+)
+
+
 class KOIPoller:
     """Background poller for KOI-net federation."""
 
@@ -236,6 +253,11 @@ class KOIPoller:
                 poll_payload, self.node_rid, source_node, self.private_key
             )
         else:
+            if REQUIRE_SIGNED_REQUESTS:
+                logger.warning(
+                    f"Poll {source_node}: KOI policy requires signed envelopes but no private key is loaded"
+                )
+                return
             request_body = poll_payload
             request_body["node_id"] = self.node_rid
 
@@ -280,9 +302,19 @@ class KOIPoller:
                 )
                 return
             pub_key = load_public_key_from_der_b64(effective_peer_key)
-            payload, _ = verify_envelope(result, pub_key)
+            payload, _ = verify_envelope(
+                result,
+                pub_key,
+                expected_source_node=source_node,
+                expected_target_node=self.node_rid,
+            )
             events = payload.get("events", [])
         else:
+            if REQUIRE_SIGNED_RESPONSES:
+                logger.warning(
+                    f"Poll {source_node}: unsigned response rejected by KOI policy"
+                )
+                return
             events = result.get("events", [])
 
         if not events:
@@ -433,6 +465,11 @@ class KOIPoller:
                 confirm_payload, self.node_rid, source_node, self.private_key
             )
         else:
+            if REQUIRE_SIGNED_REQUESTS:
+                logger.warning(
+                    f"Confirm {source_node}: KOI policy requires signed envelopes but no private key is loaded"
+                )
+                return
             request_body = confirm_payload
             request_body["node_id"] = self.node_rid
 
@@ -444,6 +481,31 @@ class KOIPoller:
                 resp = await client.post(confirm_url, json=request_body)
             if resp.status_code == 200:
                 result = resp.json()
+                if is_signed_envelope(result):
+                    async with self.pool.acquire() as conn:
+                        row = await conn.fetchrow(
+                            "SELECT public_key FROM koi_net_nodes WHERE node_rid = $1",
+                            source_node,
+                        )
+                    if row and row["public_key"]:
+                        pub_key = load_public_key_from_der_b64(row["public_key"])
+                        verify_envelope(
+                            result,
+                            pub_key,
+                            expected_source_node=source_node,
+                            expected_target_node=self.node_rid,
+                        )
+                        result = result.get("payload", {})
+                    else:
+                        logger.warning(
+                            f"Confirm {source_node}: signed response cannot be verified (missing peer key)"
+                        )
+                        return
+                elif REQUIRE_SIGNED_RESPONSES:
+                    logger.warning(
+                        f"Confirm {source_node}: unsigned response rejected by KOI policy"
+                    )
+                    return
                 logger.info(
                     f"Confirmed {len(event_ids)} events with {source_node}: {result}"
                 )

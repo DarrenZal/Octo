@@ -105,6 +105,8 @@ LOCAL_RID=$(echo "$LOCAL_HEALTH" | python3 -c "import sys,json; d=json.load(sys.
 LOCAL_NAME=$(echo "$LOCAL_HEALTH" | python3 -c "import sys,json; d=json.load(sys.stdin); n=d.get('node') or {}; print(n.get('node_name',''))" 2>/dev/null || true)
 LOCAL_KEY=$(echo "$LOCAL_HEALTH" | python3 -c "import sys,json; d=json.load(sys.stdin); n=d.get('node') or {}; print(n.get('public_key',''))" 2>/dev/null || true)
 LOCAL_BASE=$(echo "$LOCAL_HEALTH" | python3 -c "import sys,json; d=json.load(sys.stdin); n=d.get('node') or {}; print(n.get('base_url',''))" 2>/dev/null || true)
+LOCAL_STRICT=$(echo "$LOCAL_HEALTH" | python3 -c "import sys,json; d=json.load(sys.stdin); p=d.get('protocol') or {}; print(str(bool(p.get('strict_mode', False))).lower())" 2>/dev/null || true)
+LOCAL_REQUIRE_SIGNED=$(echo "$LOCAL_HEALTH" | python3 -c "import sys,json; d=json.load(sys.stdin); p=d.get('protocol') or {}; print(str(bool(p.get('require_signed_envelopes', False))).lower())" 2>/dev/null || true)
 
 if [ -z "$LOCAL_RID" ] || [ -z "$LOCAL_NAME" ]; then
   err "Could not parse local node profile from /koi-net/health"
@@ -125,6 +127,8 @@ fi
 PEER_RID=$(echo "$PEER_HEALTH" | python3 -c "import sys,json; d=json.load(sys.stdin); n=d.get('node') or {}; print(n.get('node_rid',''))" 2>/dev/null || true)
 PEER_NAME=$(echo "$PEER_HEALTH" | python3 -c "import sys,json; d=json.load(sys.stdin); n=d.get('node') or {}; print(n.get('node_name',''))" 2>/dev/null || true)
 PEER_KEY=$(echo "$PEER_HEALTH" | python3 -c "import sys,json; d=json.load(sys.stdin); n=d.get('node') or {}; print(n.get('public_key',''))" 2>/dev/null || true)
+PEER_STRICT=$(echo "$PEER_HEALTH" | python3 -c "import sys,json; d=json.load(sys.stdin); p=d.get('protocol') or {}; print(str(bool(p.get('strict_mode', False))).lower())" 2>/dev/null || true)
+PEER_REQUIRE_SIGNED=$(echo "$PEER_HEALTH" | python3 -c "import sys,json; d=json.load(sys.stdin); p=d.get('protocol') or {}; print(str(bool(p.get('require_signed_envelopes', False))).lower())" 2>/dev/null || true)
 
 if [ -z "$PEER_RID" ] || [ -z "$PEER_NAME" ]; then
   err "Could not parse peer node profile from /koi-net/health"
@@ -134,6 +138,12 @@ if [ -z "$PEER_KEY" ]; then
   warn "Peer public_key missing in health payload; signed verification may fail"
 fi
 ok "Peer node: $PEER_NAME ($PEER_RID)"
+
+if [ "${LOCAL_STRICT:-false}" = "true" ] || [ "${PEER_STRICT:-false}" = "true" ]; then
+  info "Strict-mode status: local=$LOCAL_STRICT peer=$PEER_STRICT"
+  info "Signed-envelope requirement: local=$LOCAL_REQUIRE_SIGNED peer=$PEER_REQUIRE_SIGNED"
+  warn "Ensure both peers are strict-mode compatible before production rollout."
+fi
 
 if [ -z "$EDGE_RID" ]; then
   EDGE_RID="orn:koi-net.edge:$(slugify "$LOCAL_NAME")-polls-$(slugify "$PEER_NAME")"

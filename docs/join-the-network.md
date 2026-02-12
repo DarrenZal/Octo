@@ -258,6 +258,13 @@ KOI_NODE_NAME=<your-node-name>
 KOI_STATE_DIR=/root/koi-state
 KOI_BASE_URL=http://<your-public-ip>:8351
 
+# KOI validation policy (bootstrap-safe defaults)
+KOI_STRICT_MODE=false
+KOI_REQUIRE_SIGNED_ENVELOPES=false
+KOI_REQUIRE_SIGNED_RESPONSES=false
+KOI_ENFORCE_TARGET_MATCH=false
+KOI_ENFORCE_SOURCE_KEY_RID_BINDING=false
+
 # API
 KOI_API_HOST=0.0.0.0
 KOI_API_PORT=8351
@@ -273,6 +280,8 @@ KOI_NODE_NAME=cowichan-valley
 ```
 
 `KOI_BASE_URL` must be reachable by peers. If you keep the API bound to localhost, expose `/koi-net/*` through nginx and set `KOI_BASE_URL` to that public URL.
+
+Strict-mode rollout rule: keep strict validation off during first federation bring-up, then coordinate with peers before switching `KOI_STRICT_MODE=true`.
 
 Copy the config to your agent directory:
 
@@ -900,6 +909,16 @@ If you used the setup wizard (`scripts/setup-node.sh`), federation was offered a
 
 Copy that one-liner and send it to the coordinator (Darren for Salish Sea). Once they run it, both sides are wired up and knowledge starts flowing.
 
+### Strict-mode rollout (after federation is healthy)
+
+Only enable strict mode when both sides can exchange signed envelopes without errors.
+
+1. Verify current health includes protocol flags:
+   - `curl -s http://127.0.0.1:8351/koi-net/health | python3 -m json.tool`
+2. Confirm no recurring `400`/`401` in KOI logs on either side.
+3. Set `KOI_STRICT_MODE=true` in each node env and restart services.
+4. Re-check poll/confirm loop and queue drain.
+
 ### One-command peer connect helper
 
 For existing nodes (or non-Octo coordinators), use the idempotent helper:
@@ -1001,6 +1020,7 @@ bash ~/scripts/test-federation.sh
 | Poll endpoint 404 | Use `POST /koi-net/events/poll` (not legacy `POST /koi-net/poll`) |
 | Events received but no cross-refs | Entity types may not overlap — check `koi_net_edges` RID type filters |
 | "Invalid signature" errors | Keypair mismatch — verify public keys match in `koi_net_nodes` on both sides |
+| `401 UNSIGNED_ENVELOPE_REQUIRED` or `401 INVALID_SIGNATURE` | Strict validation is enabled but peers are not compatible yet. Temporarily set `KOI_STRICT_MODE=false`, coordinate upgrade, then re-enable |
 | Connection timeout | Firewall, wrong IP, or the other node is down |
 
 ---

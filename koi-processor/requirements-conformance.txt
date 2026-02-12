@@ -1,0 +1,5 @@
+# Install in a dedicated conformance venv to avoid resolver conflicts
+# with Octo runtime pins:
+#   python3 -m venv venv-conformance
+#   venv-conformance/bin/pip install -r requirements-conformance.txt
+koi-net>=1.2.4

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import hashlib
 from base64 import b64decode, b64encode
 from typing import Any, Dict, Optional, Tuple
 
@@ -34,6 +35,10 @@ except Exception:
 
 class EnvelopeError(Exception):
     """Raised when envelope validation fails."""
+
+    def __init__(self, message: str, code: str = "ENVELOPE_ERROR"):
+        super().__init__(message)
+        self.code = code
 
 
 # =============================================================================
@@ -83,7 +88,10 @@ def _raw_to_der_signature(raw_signature: bytes) -> bytes:
     """Convert raw r||s signature to DER-encoded format."""
     byte_length = (ec.SECP256R1().key_size + 7) // 8
     if len(raw_signature) != 2 * byte_length:
-        raise EnvelopeError(f"Raw signature must be {2 * byte_length} bytes")
+        raise EnvelopeError(
+            f"Raw signature must be {2 * byte_length} bytes",
+            code="INVALID_SIGNATURE_FORMAT",
+        )
     r_bytes = raw_signature[:byte_length]
     s_bytes = raw_signature[byte_length:]
     r = int.from_bytes(r_bytes, byteorder="big")
@@ -124,6 +132,57 @@ def public_key_to_der_b64(public_key) -> str:
     return b64encode(der_bytes).decode()
 
 
+def public_key_der_sha256_hex(public_key) -> str:
+    """Hash DER-encoded public key bytes with SHA256 (full hex digest)."""
+    der_bytes = public_key.public_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return hashlib.sha256(der_bytes).hexdigest()
+
+
+def public_key_legacy_sha256_suffix(public_key) -> str:
+    """Legacy Octo hash suffix: sha256(base64(der_pubkey))[:16]."""
+    der_b64 = public_key_to_der_b64(public_key)
+    return hashlib.sha256(der_b64.encode()).hexdigest()[:16]
+
+
+def node_rid_suffix(node_rid: str) -> str:
+    """Return RID suffix after '+', or empty string if malformed."""
+    if "+" not in node_rid:
+        return ""
+    return node_rid.rsplit("+", 1)[-1]
+
+
+def node_rid_matches_public_key(
+    node_rid: str,
+    public_key,
+    allow_legacy16: bool = True,
+    allow_der64: bool = True,
+) -> bool:
+    """Check whether a node RID suffix matches an expected public-key hash.
+
+    Supported suffixes:
+    - 16-char legacy: sha256(base64(der_pubkey))[:16]
+    - 64-char canonical: sha256(der_pubkey)
+    """
+    suffix = node_rid_suffix(node_rid)
+    if not suffix:
+        return False
+
+    if len(suffix) == 16:
+        if not allow_legacy16:
+            return False
+        return suffix == public_key_legacy_sha256_suffix(public_key)
+
+    if len(suffix) == 64:
+        if not allow_der64:
+            return False
+        return suffix == public_key_der_sha256_hex(public_key)
+
+    return False
+
+
 # =============================================================================
 # Sign / Verify
 # =============================================================================
@@ -136,7 +195,7 @@ def sign_envelope(
 ) -> Dict[str, Any]:
     """Sign an envelope payload and return the signed envelope dict."""
     if not _CRYPTO_AVAILABLE:
-        raise EnvelopeError("cryptography package required for signing")
+        raise EnvelopeError("cryptography package required for signing", code="CRYPTO_UNAVAILABLE")
     message = _unsigned_envelope_bytes(payload, source_node, target_node)
     der_signature = private_key.sign(message, ec.ECDSA(hashes.SHA256()))
     raw_signature = _der_to_raw_signature(der_signature)
@@ -151,6 +210,8 @@ def sign_envelope(
 def verify_envelope(
     envelope: Dict[str, Any],
     public_key,
+    expected_source_node: Optional[str] = None,
+    expected_target_node: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], str]:
     """Verify a signed envelope using a single public key.
 
@@ -158,14 +219,27 @@ def verify_envelope(
     Raises EnvelopeError on failure.
     """
     if not _CRYPTO_AVAILABLE:
-        raise EnvelopeError("cryptography package required for verification")
+        raise EnvelopeError(
+            "cryptography package required for verification",
+            code="CRYPTO_UNAVAILABLE",
+        )
 
     source_node = envelope.get("source_node")
     target_node = envelope.get("target_node")
     signature = envelope.get("signature")
 
     if not source_node or not target_node or not signature:
-        raise EnvelopeError("Envelope missing required fields")
+        raise EnvelopeError("Envelope missing required fields", code="MISSING_ENVELOPE_FIELDS")
+    if expected_source_node and source_node != expected_source_node:
+        raise EnvelopeError(
+            f"Envelope source_node mismatch: expected {expected_source_node}, got {source_node}",
+            code="SOURCE_NODE_MISMATCH",
+        )
+    if expected_target_node and target_node != expected_target_node:
+        raise EnvelopeError(
+            f"Envelope target_node mismatch: expected {expected_target_node}, got {target_node}",
+            code="TARGET_NODE_MISMATCH",
+        )
 
     message = _unsigned_envelope_bytes(envelope["payload"], source_node, target_node)
     raw_signature = b64decode(signature)
@@ -174,7 +248,7 @@ def verify_envelope(
     try:
         public_key.verify(der_signature, message, ec.ECDSA(hashes.SHA256()))
     except InvalidSignature as exc:
-        raise EnvelopeError("Invalid envelope signature") from exc
+        raise EnvelopeError("Invalid envelope signature", code="INVALID_SIGNATURE") from exc
 
     return envelope["payload"], source_node
 

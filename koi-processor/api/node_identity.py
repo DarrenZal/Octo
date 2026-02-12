@@ -75,18 +75,52 @@ def load_private_key(path: Path):
     )
 
 
-def derive_node_rid(node_name: str, public_key) -> str:
-    """Derive node RID from name and public key.
+def node_rid_suffix(node_rid: str) -> str:
+    """Return RID hash suffix after '+'."""
+    if "+" not in node_rid:
+        return ""
+    return node_rid.rsplit("+", 1)[-1]
 
-    Format: orn:koi-net.node:{name}+{sha256(pubkey_der_b64)[:16]}
+
+def derive_node_rid_hash(public_key, hash_mode: str = "legacy16") -> str:
+    """Derive a node RID hash suffix from the public key.
+
+    Supported modes:
+    - legacy16: sha256(base64(der_pubkey))[:16]
+    - der64: sha256(der_pubkey) full 64 hex
     """
     der_bytes = public_key.public_bytes(
         encoding=serialization.Encoding.DER,
         format=serialization.PublicFormat.SubjectPublicKeyInfo,
     )
-    der_b64 = b64encode(der_bytes).decode()
-    pubkey_hash = hashlib.sha256(der_b64.encode()).hexdigest()[:16]
-    return f"orn:koi-net.node:{node_name}+{pubkey_hash}"
+    if hash_mode == "legacy16":
+        der_b64 = b64encode(der_bytes).decode()
+        return hashlib.sha256(der_b64.encode()).hexdigest()[:16]
+    if hash_mode == "der64":
+        return hashlib.sha256(der_bytes).hexdigest()
+    raise ValueError(f"Unsupported hash_mode: {hash_mode}")
+
+
+def derive_node_rid(node_name: str, public_key, hash_mode: str = "legacy16") -> str:
+    """Derive node RID from name and public key."""
+    return f"orn:koi-net.node:{node_name}+{derive_node_rid_hash(public_key, hash_mode)}"
+
+
+def node_rid_matches_public_key(
+    node_rid: str,
+    public_key,
+    allow_legacy16: bool = True,
+    allow_der64: bool = True,
+) -> bool:
+    """Check whether RID suffix matches supported hash semantics for a key."""
+    suffix = node_rid_suffix(node_rid)
+    if not suffix:
+        return False
+    if len(suffix) == 16:
+        return allow_legacy16 and suffix == derive_node_rid_hash(public_key, "legacy16")
+    if len(suffix) == 64:
+        return allow_der64 and suffix == derive_node_rid_hash(public_key, "der64")
+    return False
 
 
 def get_public_key_der_b64(private_key) -> str:

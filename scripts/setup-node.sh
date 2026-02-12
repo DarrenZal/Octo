@@ -194,6 +194,14 @@ KOI_NODE_NAME=$NODE_SLUG
 KOI_STATE_DIR=/root/koi-state
 KOI_BASE_URL=$KOI_BASE_URL_DEFAULT
 
+# KOI protocol validation policy
+# Leave strict mode off until all federation peers support signed envelopes.
+KOI_STRICT_MODE=false
+KOI_REQUIRE_SIGNED_ENVELOPES=false
+KOI_REQUIRE_SIGNED_RESPONSES=false
+KOI_ENFORCE_TARGET_MATCH=false
+KOI_ENFORCE_SOURCE_KEY_RID_BINDING=false
+
 # API
 KOI_API_HOST=$API_BIND_HOST
 KOI_API_PORT=$API_PORT
@@ -529,6 +537,9 @@ echo "     bash $OCTO_DIR/scripts/seed-vault-entities.sh http://127.0.0.1:$API_P
 echo ""
 echo "  4. Set up OpenClaw chat agent (optional):"
 echo "     See docs/join-the-network.md → Step 10"
+echo ""
+echo "  5. Before enabling strict KOI mode:"
+echo "     Coordinate with federation peers, then set KOI_STRICT_MODE=true and restart $SERVICE_NAME"
 echo ""
 echo "Useful commands:"
 echo "  systemctl status $SERVICE_NAME    # Check service"
