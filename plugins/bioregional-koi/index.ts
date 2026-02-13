@@ -479,6 +479,24 @@ const bioregionalKoiPlugin = {
       },
       { names: ["code_query"] },
     );
+
+    // federation_status — query KOI-net federation state
+    api.registerTool(
+      {
+        name: "federation_status",
+        description:
+          "Get KOI-net federation status: node identity, connected peers, event queue size, and protocol policy (strict mode, signed envelopes, etc.). Use when asked about federation state, connected nodes, or KOI-net health.",
+        parameters: {
+          type: "object",
+          properties: {},
+        },
+        async execute(_id: string, _params: Record<string, unknown>) {
+          const data = await koiRequest("/koi-net/health");
+          return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+        },
+      },
+      { names: ["federation_status"] },
+    );
   },
 };
 
