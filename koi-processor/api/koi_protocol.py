@@ -65,7 +65,8 @@ class NodeProfile(BaseModel):
     base_url: Optional[str] = None  # None for PARTIAL nodes
     provides: NodeProvides
     public_key: Optional[str] = None  # DER-encoded, base64
-    # Deferred to post-Phase 5: ontology_uri, ontology_version
+    ontology_uri: Optional[str] = None
+    ontology_version: Optional[str] = None
 
 
 # =============================================================================
@@ -170,9 +171,15 @@ class SignedEnvelope(BaseModel):
 # =============================================================================
 
 def timestamp_to_z_format(ts: str) -> str:
-    """Convert timestamp to Z suffix format for KOI-net compatibility."""
+    """Convert timestamp to Z suffix format for KOI-net compatibility.
+
+    Returns a valid ISO 8601 UTC timestamp with Z suffix. If the input is
+    empty or falsy, returns the current UTC time (koi-net Manifest requires
+    a valid datetime for the timestamp field).
+    """
     if not ts:
-        return ts
+        from datetime import datetime, timezone
+        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     if ts.endswith("+00:00"):
         return ts[:-6] + "Z"
     if "+00:00" in ts:

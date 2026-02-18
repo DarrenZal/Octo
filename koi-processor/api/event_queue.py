@@ -2,7 +2,7 @@
 Database-backed KOI-net Event Queue
 
 Uses the koi_net_events table (migration 039) for event persistence.
-Supports add, poll, confirm, and cleanup operations with per-edge TTL.
+Supports add, poll, peek, mark_delivered, confirm, and cleanup operations with per-edge TTL.
 """
 
 from __future__ import annotations
@@ -38,27 +38,60 @@ class EventQueue:
         contents: Optional[Dict[str, Any]] = None,
         source_node: Optional[str] = None,
         ttl_hours: int = DEFAULT_TTL_HOURS,
-    ) -> str:
-        """Add an event to the queue. Returns the event_id."""
+        event_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Add an event to the queue. Returns the event_id.
+
+        If event_id is provided (inbound from a peer), it is preserved and
+        used for dedup via the UNIQUE(source_node, event_id) index.
+        Returns None if the event was a duplicate (ON CONFLICT DO NOTHING).
+        """
+        effective_source = source_node or self.node_rid
         async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                INSERT INTO koi_net_events
-                    (event_type, rid, manifest, contents, source_node, expires_at)
-                VALUES
-                    ($1, $2, $3, $4, $5, NOW() + ($6 || ' hours')::INTERVAL)
-                RETURNING event_id::TEXT
-                """,
-                event_type,
-                rid,
-                json.dumps(manifest) if manifest else None,
-                json.dumps(contents) if contents else None,
-                source_node or self.node_rid,
-                str(ttl_hours),
-            )
-            event_id = row["event_id"]
-            logger.info(f"Queued {event_type} event for {rid} (id={event_id})")
-            return event_id
+            if event_id:
+                # Inbound event with sender-assigned event_id — dedup on insert
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO koi_net_events
+                        (event_id, event_type, rid, manifest, contents, source_node, expires_at)
+                    VALUES
+                        ($1::UUID, $2, $3, $4, $5, $6, NOW() + ($7 || ' hours')::INTERVAL)
+                    ON CONFLICT (source_node, event_id) WHERE event_id IS NOT NULL DO NOTHING
+                    RETURNING event_id::TEXT
+                    """,
+                    event_id,
+                    event_type,
+                    rid,
+                    json.dumps(manifest) if manifest else None,
+                    json.dumps(contents) if contents else None,
+                    effective_source,
+                    str(ttl_hours),
+                )
+                if row is None:
+                    logger.debug(f"Duplicate event {event_id} from {effective_source}, skipped")
+                    return None
+                logger.info(f"Queued {event_type} event for {rid} (id={event_id})")
+                return event_id
+            else:
+                # Locally generated event — DB assigns event_id
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO koi_net_events
+                        (event_type, rid, manifest, contents, source_node, expires_at)
+                    VALUES
+                        ($1, $2, $3, $4, $5, NOW() + ($6 || ' hours')::INTERVAL)
+                    RETURNING event_id::TEXT
+                    """,
+                    event_type,
+                    rid,
+                    json.dumps(manifest) if manifest else None,
+                    json.dumps(contents) if contents else None,
+                    effective_source,
+                    str(ttl_hours),
+                )
+                new_id = row["event_id"]
+                logger.info(f"Queued {event_type} event for {rid} (id={new_id})")
+                return new_id
 
     async def poll(
         self,
@@ -97,7 +130,7 @@ class EventQueue:
                 if rid_types:
                     # RID format: orn:koi-net.{type}:{slug}+{hash}
                     rid = row["rid"]
-                    rid_type = _extract_rid_type(rid)
+                    rid_type = extract_rid_type(rid)
                     if rid_type and rid_type not in rid_types:
                         continue
 
@@ -129,6 +162,80 @@ class EventQueue:
                 )
 
             return events
+
+    async def peek_undelivered(
+        self,
+        target_node: str,
+        limit: int = 50,
+        rid_types: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Get events not yet delivered to target_node WITHOUT marking them.
+
+        Returns list of event dicts with event_id for later marking.
+        Used by WEBHOOK push delivery (peek -> push -> mark pattern).
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, event_id::TEXT, event_type, rid, manifest, contents, source_node, queued_at
+                FROM koi_net_events
+                WHERE NOT ($1 = ANY(delivered_to))
+                  AND expires_at > NOW()
+                ORDER BY queued_at ASC
+                LIMIT $2
+                """,
+                target_node,
+                limit,
+            )
+
+            if not rows:
+                return []
+
+            events = []
+            for row in rows:
+                if rid_types:
+                    rid = row["rid"]
+                    rid_type = extract_rid_type(rid)
+                    if rid_type and rid_type not in rid_types:
+                        continue
+
+                events.append({
+                    "event_id": row["event_id"],
+                    "event_type": row["event_type"],
+                    "rid": row["rid"],
+                    "manifest": json.loads(row["manifest"]) if row["manifest"] else None,
+                    "contents": json.loads(row["contents"]) if row["contents"] else None,
+                    "source_node": row["source_node"],
+                    "queued_at": row["queued_at"].isoformat() if row["queued_at"] else None,
+                })
+
+            return events
+
+    async def mark_delivered(self, event_ids: List[str], target_node: str) -> int:
+        """Mark specific events as delivered to target_node.
+
+        Returns count of events actually marked (for verification).
+        Idempotent — marking an already-delivered event is a no-op.
+        """
+        if not event_ids:
+            return 0
+
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE koi_net_events
+                SET delivered_to = array_append(delivered_to, $1)
+                WHERE event_id::TEXT = ANY($2)
+                  AND NOT ($1 = ANY(delivered_to))
+                  AND expires_at > NOW()
+                """,
+                target_node,
+                event_ids,
+            )
+            count = int(result.split()[-1])
+            if count > 0:
+                logger.info(f"Marked {count} events as delivered to {target_node}")
+            return count
 
     async def confirm(
         self,
@@ -177,7 +284,7 @@ class EventQueue:
             return row["cnt"]
 
 
-def _extract_rid_type(rid: str) -> Optional[str]:
+def extract_rid_type(rid: str) -> Optional[str]:
     """Extract entity type from RID string.
 
     Expected formats:

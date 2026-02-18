@@ -362,7 +362,7 @@ else
 
   if [[ "${FED_CONFIRM,,}" != "n" ]]; then
     # Coordinator defaults (Octo / Salish Sea)
-    COORD_RID="orn:koi-net.node:octo-salish-sea+50a3c9eac05c807f"
+    COORD_RID="orn:koi-net.node:octo-salish-sea+50a3c9eac05c807f7f0ad114aad3b50b67bbbe1015664e39988f967f9ef4502b"
     COORD_NAME="octo-salish-sea"
     COORD_URL="http://45.132.245.30:8351"
 

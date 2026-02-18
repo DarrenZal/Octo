@@ -56,15 +56,17 @@ from api.koi_envelope import (
     sign_envelope,
     verify_envelope,
 )
-from api.node_identity import load_or_create_identity, node_rid_matches_public_key
+from api.node_identity import (
+    derive_node_rid_hash,
+    load_or_create_identity,
+    node_rid_matches_public_key,
+    node_rid_suffix,
+)
 from api.event_queue import EventQueue
 
 logger = logging.getLogger(__name__)
 
-try:
-    from rid_lib.ext.utils import sha256_hash_json as rid_sha256_hash_json
-except Exception:
-    rid_sha256_hash_json = None
+from rid_lib.ext.utils import sha256_hash_json as rid_sha256_hash_json
 
 koi_net_router = APIRouter(tags=["koi-net"])
 
@@ -93,6 +95,10 @@ def _security_policy() -> Dict[str, bool]:
     )
     allow_legacy16 = _bool_env("KOI_ALLOW_LEGACY16_NODE_RID", True)
     allow_der64 = _bool_env("KOI_ALLOW_DER64_NODE_RID", True)
+    allow_b64_64 = _bool_env("KOI_ALLOW_B64_64_NODE_RID", True)
+    require_approved_edge_for_poll = _bool_env(
+        "KOI_NET_REQUIRE_APPROVED_EDGE_FOR_POLL", strict_mode,
+    )
     return {
         "strict_mode": strict_mode,
         "require_signed": require_signed,
@@ -100,7 +106,36 @@ def _security_policy() -> Dict[str, bool]:
         "enforce_source_binding": enforce_source_binding,
         "allow_legacy16": allow_legacy16,
         "allow_der64": allow_der64,
+        "allow_b64_64": allow_b64_64,
+        "require_approved_edge_for_poll": require_approved_edge_for_poll,
     }
+
+
+# BlockScience ErrorType mapping (api_models.py:55-57)
+# Octo error codes → BlockScience ErrorType values
+# IMPORTANT: "unknown_node" triggers handshake retry in BlockScience clients
+# (error_handler.py:44-47), so only use it for genuinely unknown nodes.
+# Pre-authentication / parse errors use "invalid_signature" to signal
+# "don't retry with handshake, the request itself is malformed."
+_ERROR_TYPE_MAP = {
+    "UNKNOWN_SOURCE_NODE": "unknown_node",
+    "SOURCE_NODE_KEY_BINDING_FAILED": "invalid_key",
+    "INVALID_SIGNATURE": "invalid_signature",
+    "INVALID_SIGNATURE_FORMAT": "invalid_signature",
+    "TARGET_NODE_MISMATCH": "invalid_target",
+    "SOURCE_NODE_MISMATCH": "invalid_target",
+    # Pre-auth / parse errors → invalid_signature (not unknown_node)
+    "INVALID_JSON": "invalid_signature",
+    "INVALID_PAYLOAD": "invalid_signature",
+    "UNSIGNED_ENVELOPE_REQUIRED": "invalid_signature",
+    "MISSING_ENVELOPE_FIELDS": "invalid_signature",
+    "ENVELOPE_ERROR": "invalid_signature",
+    "CRYPTO_UNAVAILABLE": "invalid_signature",
+}
+
+# Fallback for unmapped codes — invalid_signature is safer than unknown_node
+# because it won't trigger handshake retries in BlockScience clients
+_DEFAULT_ERROR_TYPE = "invalid_signature"
 
 
 def _protocol_error(
@@ -109,7 +144,14 @@ def _protocol_error(
     message: str,
     **extra: Any,
 ) -> JSONResponse:
-    body = {"error": message, "error_code": code}
+    # BlockScience clients expect: {"type": "error_response", "error": <ErrorType>}
+    error_type = _ERROR_TYPE_MAP.get(code, _DEFAULT_ERROR_TYPE)
+    body = {
+        "type": "error_response",
+        "error": error_type,
+        "error_code": code,
+        "message": message,
+    }
     if extra:
         body.update(extra)
     return JSONResponse(status_code=status_code, content=body)
@@ -124,19 +166,8 @@ def _envelope_error_response(exc: EnvelopeError) -> JSONResponse:
 
 
 def _canonical_sha256_json(data: Any) -> str:
-    """Compute a deterministic sha256 hash for JSON-like data.
-
-    Uses rid-lib canonical hashing when available, with a stable fallback.
-    """
-    if rid_sha256_hash_json is not None:
-        try:
-            return rid_sha256_hash_json(data)
-        except Exception:
-            pass
-    canonical = json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    import hashlib
-
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    """Compute JCS-canonical sha256 hash using rid-lib."""
+    return rid_sha256_hash_json(data)
 
 
 def _manifest_sha256_hash(manifest: Dict[str, Any], contents: Optional[Dict[str, Any]] = None) -> str:
@@ -154,7 +185,7 @@ def _manifest_sha256_hash(manifest: Dict[str, Any], contents: Optional[Dict[str,
     )
 
 
-async def setup_koi_net(pool: asyncpg.Pool):
+async def setup_koi_net(pool: asyncpg.Pool, embed_fn=None):
     """Initialize KOI-net subsystem. Called from app startup."""
     global _private_key, _node_profile, _event_queue, _db_pool, _poller
     _db_pool = pool
@@ -167,7 +198,24 @@ async def setup_koi_net(pool: asyncpg.Pool):
         base_url=base_url,
         node_type="FULL",
     )
+    _node_profile.ontology_uri = os.getenv(
+        "KOI_ONTOLOGY_URI", "http://bkc.regen.network/ontology"
+    )
+    _node_profile.ontology_version = os.getenv("KOI_ONTOLOGY_VERSION", "1.0.0")
     _event_queue = EventQueue(pool, _node_profile.node_rid)
+
+    # Build pipeline if feature-flagged
+    use_pipeline = _bool_env("KOI_USE_PIPELINE", False)
+    pipeline = None
+    if use_pipeline:
+        from api.pipeline import KnowledgePipeline, OctoHandlerContext, _default_handlers
+        pipeline_ctx = OctoHandlerContext(
+            pool=pool, node_rid=_node_profile.node_rid,
+            node_profile=_node_profile, event_queue=_event_queue,
+            embed_fn=embed_fn,
+        )
+        pipeline = KnowledgePipeline(ctx=pipeline_ctx, handlers=_default_handlers())
+        logger.info("KOI pipeline enabled (KOI_USE_PIPELINE=true)")
 
     # Start background poller
     _poller = KOIPoller(
@@ -175,19 +223,25 @@ async def setup_koi_net(pool: asyncpg.Pool):
         node_rid=_node_profile.node_rid,
         private_key=_private_key,
         node_profile=_node_profile,
+        pipeline=pipeline,
+        use_pipeline=use_pipeline,
+        event_queue=_event_queue,
     )
     await _poller.start()
 
     policy = _security_policy()
     logger.info(
         "KOI-net validation policy: strict_mode=%s require_signed=%s "
-        "enforce_target=%s enforce_source_binding=%s allow_legacy16=%s allow_der64=%s",
+        "enforce_target=%s enforce_source_binding=%s allow_legacy16=%s "
+        "allow_der64=%s allow_b64_64=%s require_approved_edge_for_poll=%s",
         policy["strict_mode"],
         policy["require_signed"],
         policy["enforce_target"],
         policy["enforce_source_binding"],
         policy["allow_legacy16"],
         policy["allow_der64"],
+        policy["allow_b64_64"],
+        policy["require_approved_edge_for_poll"],
     )
     logger.info(f"KOI-net initialized: {_node_profile.node_rid}")
 
@@ -266,17 +320,22 @@ async def _refresh_peer_public_key(source_node: str):
 
     node_name = node.get("node_name") or source_node
     node_type = node.get("node_type") or "FULL"
+    ontology_uri = node.get("ontology_uri")
+    ontology_version = node.get("ontology_version")
     async with _db_pool.acquire() as conn:
         await conn.execute(
             """
             INSERT INTO koi_net_nodes
-                (node_rid, node_name, node_type, base_url, public_key, status, last_seen)
-            VALUES ($1, $2, $3, $4, $5, 'active', NOW())
+                (node_rid, node_name, node_type, base_url, public_key,
+                 ontology_uri, ontology_version, status, last_seen)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', NOW())
             ON CONFLICT (node_rid) DO UPDATE SET
                 node_name = EXCLUDED.node_name,
                 node_type = EXCLUDED.node_type,
                 base_url = EXCLUDED.base_url,
                 public_key = EXCLUDED.public_key,
+                ontology_uri = COALESCE(EXCLUDED.ontology_uri, koi_net_nodes.ontology_uri),
+                ontology_version = COALESCE(EXCLUDED.ontology_version, koi_net_nodes.ontology_version),
                 status = 'active',
                 last_seen = NOW()
             """,
@@ -285,6 +344,8 @@ async def _refresh_peer_public_key(source_node: str):
             node_type,
             base_url,
             public_key,
+            ontology_uri,
+            ontology_version,
         )
 
     logger.info(f"Refreshed public key for {source_node} from {base_url}/koi-net/health")
@@ -292,6 +353,128 @@ async def _refresh_peer_public_key(source_node: str):
         "der_b64": public_key,
         "public_key": load_public_key_from_der_b64(public_key),
     }
+
+
+def _extract_bootstrap_key(
+    body: Dict[str, Any], source_node: str
+) -> Optional[Dict[str, Any]]:
+    """Extract and validate a bootstrap key from a broadcast payload.
+
+    BlockScience nodes self-introduce by broadcasting FORGET+NEW events where
+    the NEW event carries a NodeProfile with a public_key. We validate that
+    the source_node RID hash matches sha256(base64(DER(pubkey))) before
+    returning the key material.
+
+    Does NOT persist anything to the database — that happens after envelope
+    signature verification succeeds (see _persist_bootstrap_peer).
+
+    Returns a key_record dict (with extra "bootstrap_contents") or None.
+    """
+    payload = body.get("payload")
+    if not isinstance(payload, dict):
+        return None
+
+    events = payload.get("events")
+    if not isinstance(events, list):
+        return None
+
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("event_type") != "NEW":
+            continue
+        if ev.get("rid") != source_node:
+            continue
+        contents = ev.get("contents")
+        if not isinstance(contents, dict):
+            continue
+        public_key_b64 = contents.get("public_key")
+        if not public_key_b64:
+            continue
+
+        # Validate key-RID binding: source_node hash suffix must match
+        # sha256(base64(DER(pubkey))) — prevents forged self-introductions
+        try:
+            pub_key = load_public_key_from_der_b64(public_key_b64)
+        except Exception:
+            logger.warning(
+                f"Bootstrap: invalid public key in NEW event for {source_node}"
+            )
+            return None
+
+        suffix = node_rid_suffix(source_node)
+        if not suffix:
+            return None
+
+        # Check against b64_64 (canonical) and legacy16
+        b64_hash = derive_node_rid_hash(pub_key, "b64_64")
+        legacy_hash = derive_node_rid_hash(pub_key, "legacy16")
+        if suffix != b64_hash and suffix != legacy_hash:
+            logger.warning(
+                f"Bootstrap: RID hash mismatch for {source_node} — "
+                f"expected {b64_hash[:16]}... or {legacy_hash}, got {suffix}"
+            )
+            return None
+
+        # Key-RID binding verified — return key record (no DB write yet)
+        return {
+            "der_b64": public_key_b64,
+            "public_key": pub_key,
+            "bootstrap_contents": contents,
+        }
+
+    return None
+
+
+async def _persist_bootstrap_peer(
+    source_node: str, key_record: Dict[str, Any]
+) -> None:
+    """Persist a bootstrapped peer to koi_net_nodes after signature verification.
+
+    Only call this after verify_envelope has succeeded — the key_record
+    must have been returned by _extract_bootstrap_key.
+    """
+    contents = key_record.get("bootstrap_contents")
+    if not contents or not _db_pool:
+        return
+
+    node_name = contents.get("node_name") or source_node
+    node_type = contents.get("node_type") or "FULL"
+    base_url = contents.get("base_url")
+    public_key_b64 = key_record["der_b64"]
+    ontology_uri = contents.get("ontology_uri")
+    ontology_version = contents.get("ontology_version")
+
+    async with _db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO koi_net_nodes
+                (node_rid, node_name, node_type, base_url,
+                 public_key, ontology_uri, ontology_version,
+                 status, last_seen)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', NOW())
+            ON CONFLICT (node_rid) DO UPDATE SET
+                node_name = EXCLUDED.node_name,
+                node_type = EXCLUDED.node_type,
+                base_url = EXCLUDED.base_url,
+                public_key = EXCLUDED.public_key,
+                ontology_uri = COALESCE(EXCLUDED.ontology_uri, koi_net_nodes.ontology_uri),
+                ontology_version = COALESCE(EXCLUDED.ontology_version, koi_net_nodes.ontology_version),
+                status = 'active',
+                last_seen = NOW()
+            """,
+            source_node,
+            node_name,
+            node_type,
+            base_url,
+            public_key_b64,
+            ontology_uri,
+            ontology_version,
+        )
+    logger.info(
+        f"Bootstrap: registered new peer {source_node} ({node_name}) "
+        f"via broadcast NEW event"
+    )
 
 
 async def _unwrap_request(request: Request, allow_unsigned: bool = False):
@@ -330,6 +513,13 @@ async def _unwrap_request(request: Request, allow_unsigned: bool = False):
     key_record = await _get_peer_key_record(source_node)
     if not key_record:
         key_record = await _refresh_peer_public_key(source_node)
+    is_bootstrap = False
+    if not key_record or not key_record.get("public_key"):
+        # Attempt bootstrap: extract key from NodeProfile NEW event in payload
+        # (BlockScience-style self-introduction via broadcast).
+        # Does NOT persist to DB yet — we verify the signature first.
+        key_record = _extract_bootstrap_key(body, source_node)
+        is_bootstrap = True
     if not key_record or not key_record.get("public_key"):
         raise EnvelopeError(f"No public key for {source_node}", code="UNKNOWN_SOURCE_NODE")
 
@@ -339,6 +529,7 @@ async def _unwrap_request(request: Request, allow_unsigned: bool = False):
             key_record["public_key"],
             allow_legacy16=policy["allow_legacy16"],
             allow_der64=policy["allow_der64"],
+            allow_b64_64=policy["allow_b64_64"],
         )
         if not bound:
             raise EnvelopeError(
@@ -353,6 +544,11 @@ async def _unwrap_request(request: Request, allow_unsigned: bool = False):
         if policy["enforce_target"] and _node_profile
         else None,
     )
+
+    # Signature verified — now safe to persist the bootstrapped peer
+    if is_bootstrap:
+        await _persist_bootstrap_peer(source_node, key_record)
+
     return payload, source, True
 
 
@@ -391,8 +587,9 @@ async def handshake(request: Request):
             """
             INSERT INTO koi_net_nodes
                 (node_rid, node_name, node_type, base_url, public_key,
-                 provides_event, provides_state, last_seen, status)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), 'active')
+                 provides_event, provides_state, ontology_uri, ontology_version,
+                 last_seen, status)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), 'active')
             ON CONFLICT (node_rid) DO UPDATE SET
                 node_name = EXCLUDED.node_name,
                 node_type = EXCLUDED.node_type,
@@ -400,6 +597,8 @@ async def handshake(request: Request):
                 public_key = EXCLUDED.public_key,
                 provides_event = EXCLUDED.provides_event,
                 provides_state = EXCLUDED.provides_state,
+                ontology_uri = COALESCE(EXCLUDED.ontology_uri, koi_net_nodes.ontology_uri),
+                ontology_version = COALESCE(EXCLUDED.ontology_version, koi_net_nodes.ontology_version),
                 last_seen = NOW(),
                 status = 'active'
             """,
@@ -410,6 +609,8 @@ async def handshake(request: Request):
             peer.public_key,
             peer.provides.event,
             peer.provides.state,
+            peer.ontology_uri,
+            peer.ontology_version,
         )
 
     logger.info(f"Handshake with {peer.node_rid} ({peer.node_name})")
@@ -448,14 +649,16 @@ async def events_broadcast(request: Request):
             continue
 
         try:
-            await _event_queue.add(
+            result = await _event_queue.add(
                 event_type=event_type,
                 rid=rid,
                 manifest=event_data.get("manifest"),
                 contents=event_data.get("contents"),
                 source_node=source_node or "unknown",
+                event_id=event_data.get("event_id"),
             )
-            queued += 1
+            if result is not None:
+                queued += 1
         except Exception as exc:
             logger.warning(f"Failed to queue event {rid}: {exc}")
 
@@ -490,6 +693,7 @@ async def events_poll(request: Request):
 
     # Check which rid_types this node should receive (from edge config)
     rid_types = None
+    has_approved_edge = False
     async with _db_pool.acquire() as conn:
         edge = await conn.fetchrow(
             """
@@ -499,8 +703,21 @@ async def events_poll(request: Request):
             requesting_node,
             _node_profile.node_rid,
         )
-        if edge and edge["rid_types"]:
-            rid_types = edge["rid_types"]
+        if edge:
+            has_approved_edge = True
+            if edge["rid_types"]:
+                rid_types = edge["rid_types"]
+
+    # In strict mode (or when explicitly configured), unapproved peers get nothing
+    policy = _security_policy()
+    if not has_approved_edge and policy["require_approved_edge_for_poll"]:
+        logger.info(
+            f"Poll: no approved edge for {requesting_node}, returning empty (strict)"
+        )
+        resp = EventsPayloadResponse(events=[])
+        return JSONResponse(
+            content=_wrap_response(resp.model_dump(exclude_none=True), requesting_node, signed)
+        )
 
     events = await _event_queue.poll(requesting_node, limit, rid_types)
 
@@ -704,6 +921,7 @@ async def koi_net_health():
         "node": _node_profile.model_dump() if _node_profile else None,
         "peers": peers,
         "event_queue_size": queue_size,
+        "pipeline_enabled": _poller is not None and _poller.use_pipeline and _poller.pipeline is not None,
         "protocol": {
             "strict_mode": policy["strict_mode"],
             "require_signed_envelopes": policy["require_signed"],

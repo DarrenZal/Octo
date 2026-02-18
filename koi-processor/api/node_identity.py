@@ -82,17 +82,21 @@ def node_rid_suffix(node_rid: str) -> str:
     return node_rid.rsplit("+", 1)[-1]
 
 
-def derive_node_rid_hash(public_key, hash_mode: str = "legacy16") -> str:
+def derive_node_rid_hash(public_key, hash_mode: str = "b64_64") -> str:
     """Derive a node RID hash suffix from the public key.
 
     Supported modes:
-    - legacy16: sha256(base64(der_pubkey))[:16]
-    - der64: sha256(der_pubkey) full 64 hex
+    - b64_64: sha256(base64(der_pubkey)) full 64 hex — BlockScience canonical
+    - legacy16: sha256(base64(der_pubkey))[:16] — Octo legacy (truncated)
+    - der64: sha256(der_pubkey) full 64 hex — raw DER bytes (non-canonical)
     """
     der_bytes = public_key.public_bytes(
         encoding=serialization.Encoding.DER,
         format=serialization.PublicFormat.SubjectPublicKeyInfo,
     )
+    if hash_mode == "b64_64":
+        der_b64 = b64encode(der_bytes).decode()
+        return hashlib.sha256(der_b64.encode()).hexdigest()
     if hash_mode == "legacy16":
         der_b64 = b64encode(der_bytes).decode()
         return hashlib.sha256(der_b64.encode()).hexdigest()[:16]
@@ -101,7 +105,7 @@ def derive_node_rid_hash(public_key, hash_mode: str = "legacy16") -> str:
     raise ValueError(f"Unsupported hash_mode: {hash_mode}")
 
 
-def derive_node_rid(node_name: str, public_key, hash_mode: str = "legacy16") -> str:
+def derive_node_rid(node_name: str, public_key, hash_mode: str = "b64_64") -> str:
     """Derive node RID from name and public key."""
     return f"orn:koi-net.node:{node_name}+{derive_node_rid_hash(public_key, hash_mode)}"
 
@@ -111,6 +115,7 @@ def node_rid_matches_public_key(
     public_key,
     allow_legacy16: bool = True,
     allow_der64: bool = True,
+    allow_b64_64: bool = True,
 ) -> bool:
     """Check whether RID suffix matches supported hash semantics for a key."""
     suffix = node_rid_suffix(node_rid)
@@ -119,7 +124,12 @@ def node_rid_matches_public_key(
     if len(suffix) == 16:
         return allow_legacy16 and suffix == derive_node_rid_hash(public_key, "legacy16")
     if len(suffix) == 64:
-        return allow_der64 and suffix == derive_node_rid_hash(public_key, "der64")
+        # Try b64_64 (BlockScience canonical) first, then der64 fallback
+        if allow_b64_64 and suffix == derive_node_rid_hash(public_key, "b64_64"):
+            return True
+        if allow_der64 and suffix == derive_node_rid_hash(public_key, "der64"):
+            return True
+        return False
     return False
 
 

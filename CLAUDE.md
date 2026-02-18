@@ -28,10 +28,15 @@ Octo is a bioregional knowledge commoning agent built on OpenClaw, deployed on a
 
 ### KOI-net Node Identities
 
-| Node | RID | Public Key (truncated) |
-|------|-----|----------------------|
-| **Octo** | `orn:koi-net.node:octo-salish-sea+50a3c9eac05c807f` | `MFkwEwYH...` |
-| **GV** | `orn:koi-net.node:greater-victoria+81ec47d80f231444` | `MFkwEwYH...` |
+Node RID hash mode: `b64_64` = `sha256(base64(DER(pubkey)))` — BlockScience canonical (64 hex chars).
+Legacy `legacy16` RIDs (16 hex chars) still accepted during migration via `KOI_ALLOW_LEGACY16_NODE_RID=true`.
+
+| Node | Node RID | Public Key (truncated) |
+|------|----------|----------------------|
+| **Octo** | `orn:koi-net.node:octo-salish-sea+50a3c9eac05c807f7f0ad114aad3b50b67bbbe1015664e39988f967f9ef4502b` | `MFkwEwYH...` |
+| **GV** | `orn:koi-net.node:greater-victoria+81ec47d80f2314449b0f4342c087eb91dabf7811fc2d846233c389ef2b0b6f58` | `MFkwEwYH...` |
+
+> **RID migration complete (2026-02-18):** Node RIDs migrated from legacy16 (16-char) to b64_64 (64-char BlockScience canonical). Same keypairs, full SHA-256 hash suffix.
 
 Private keys stored at `/root/koi-state/{node_name}_private_key.pem`.
 

@@ -210,3 +210,38 @@ def is_signed_envelope(body: Dict[str, Any]) -> bool:
         and "source_node" in body
         and "target_node" in body
     )
+
+
+def unwrap_and_verify_response(
+    raw_body: Dict[str, Any],
+    expected_source_node: str,
+    peer_public_key_b64: Optional[str] = None,
+    expected_target_node: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Unwrap and verify a response that may or may not be a signed envelope.
+
+    1. If raw_body is a signed envelope, verify signature against peer's public key.
+    2. Verify envelope.source_node == expected_source_node.
+    3. Verify envelope.target_node == expected_target_node (if provided).
+    4. If not a signed envelope, return raw_body as-is (permissive mode).
+    5. On verification failure, raise EnvelopeError.
+
+    Returns the inner payload dict.
+    """
+    if not is_signed_envelope(raw_body):
+        return raw_body
+
+    if not peer_public_key_b64:
+        raise EnvelopeError(
+            f"Signed response from {expected_source_node} but no public key available",
+            code="UNKNOWN_SOURCE_NODE",
+        )
+
+    pub_key = load_public_key_from_der_b64(peer_public_key_b64)
+    payload, source = verify_envelope(
+        raw_body,
+        pub_key,
+        expected_source_node=expected_source_node,
+        expected_target_node=expected_target_node,
+    )
+    return payload

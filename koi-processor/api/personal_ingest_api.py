@@ -977,17 +977,8 @@ async def startup():
         async with db_pool.acquire() as conn:
             await ensure_schema(conn)
 
-        # Mount KOI-net protocol router if enabled
-        if KOI_NET_ENABLED:
-            try:
-                from api.koi_net_router import koi_net_router, setup_koi_net
-                app.include_router(koi_net_router, prefix="/koi-net")
-                await setup_koi_net(db_pool)
-                logger.info("KOI-net protocol endpoints mounted at /koi-net/")
-            except Exception as e:
-                logger.error(f"Failed to initialize KOI-net: {e}")
-
-        # Initialize OpenAI client if API key is available
+        # Initialize OpenAI client if API key is available (before KOI-net so
+        # generate_embedding can be injected into the pipeline)
         openai_available = check_openai_availability()
         if openai_available:
             try:
@@ -1004,6 +995,19 @@ async def startup():
         else:
             logger.warning("OPENAI_API_KEY not set")
             logger.info("Tier 2 semantic matching: DISABLED (falling back to fuzzy matching)")
+
+        # Mount KOI-net protocol router if enabled
+        if KOI_NET_ENABLED:
+            try:
+                from api.koi_net_router import koi_net_router, setup_koi_net
+                app.include_router(koi_net_router, prefix="/koi-net")
+                await setup_koi_net(
+                    db_pool,
+                    embed_fn=generate_embedding if openai_available else None,
+                )
+                logger.info("KOI-net protocol endpoints mounted at /koi-net/")
+            except Exception as e:
+                logger.error(f"Failed to initialize KOI-net: {e}")
 
         # Initialize GitHub sensor if enabled
         if GITHUB_SENSOR_ENABLED:
@@ -3454,6 +3458,24 @@ async def search_knowledge_base(request: SearchRequest):
                     "source": row['source_sensor'],
                     "metadata": metadata,
                 }
+
+                # Build quartz_url for documents served on the Quartz site
+                if QUARTZ_BASE_URL:
+                    rid = row['rid']
+                    if rid.startswith('github:'):
+                        # github:Owner/Repo:path/to/file.md → path/to/file
+                        parts = rid.split(':', 2)
+                        if len(parts) == 3:
+                            file_path = parts[2]
+                            if file_path.endswith('.md'):
+                                slug = file_path[:-3]  # strip .md
+                                result['quartz_url'] = f"{QUARTZ_BASE_URL}/{slug}"
+                    elif rid.startswith('vault:'):
+                        vault_path = rid.replace('vault:', '', 1)
+                        if vault_path.endswith('.md'):
+                            vault_path = vault_path[:-3]
+                        slug = vault_path.replace(' ', '-')
+                        result['quartz_url'] = f"{QUARTZ_BASE_URL}/{slug}"
 
                 # Add email-specific metadata if available
                 if row['source_sensor'] == 'email-sensor':

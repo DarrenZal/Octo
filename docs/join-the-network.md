@@ -891,7 +891,7 @@ How to decide who to connect to:
 ### How KOI-net handshake works
 
 1. Your node starts with `KOI_NET_ENABLED=true` and generates an ECDSA P-256 keypair (stored in `KOI_STATE_DIR`)
-2. Your node gets a **Node RID** — a unique identifier like `orn:koi-net.node:cowichan-valley+a1b2c3d4`
+2. Your node gets a **Node RID** — a unique identifier like `orn:koi-net.node:cowichan-valley+<64-char-sha256-hex>` (derived from `sha256(base64(DER(pubkey)))`)
 3. You share your **IP address** and **Node RID** with the coordinator (Darren for Salish Sea)
 4. The coordinator configures a **federation edge** on their side, specifying which RID types to exchange
 5. Both nodes begin polling each other for events
@@ -946,7 +946,7 @@ docker exec -i regen-koi-postgres psql -U postgres -d YOUR_DB <<'SQL'
 
 -- Register Octo (Salish Sea coordinator)
 INSERT INTO koi_net_nodes (node_rid, node_name, node_type, base_url, public_key, status, last_seen)
-  VALUES ('orn:koi-net.node:octo-salish-sea+50a3c9eac05c807f', 'octo-salish-sea', 'FULL',
+  VALUES ('orn:koi-net.node:octo-salish-sea+50a3c9eac05c807f7f0ad114aad3b50b67bbbe1015664e39988f967f9ef4502b', 'octo-salish-sea', 'FULL',
           'http://45.132.245.30:8351', '<OCTO_PUBLIC_KEY_BASE64>', 'active', now())
   ON CONFLICT (node_rid) DO UPDATE SET
     node_name = EXCLUDED.node_name,
@@ -960,7 +960,7 @@ INSERT INTO koi_net_nodes (node_rid, node_name, node_type, base_url, public_key,
 -- Edge semantics: source = data provider (Octo), target = poller (your node)
 INSERT INTO koi_net_edges (edge_rid, source_node, target_node, edge_type, status, rid_types)
   VALUES ('orn:koi-net.edge:YOUR-SLUG-polls-octo-salish-sea',
-          'orn:koi-net.node:octo-salish-sea+50a3c9eac05c807f',
+          'orn:koi-net.node:octo-salish-sea+50a3c9eac05c807f7f0ad114aad3b50b67bbbe1015664e39988f967f9ef4502b',
           'YOUR_NODE_RID',
           'POLL', 'APPROVED', '{Practice,Pattern,CaseStudy,Bioregion}')
   ON CONFLICT (edge_rid) DO UPDATE SET

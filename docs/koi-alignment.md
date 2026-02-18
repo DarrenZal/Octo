@@ -1,6 +1,8 @@
 # KOI Alignment: Octo vs BlockScience KOI-net
 
-Last updated: 2026-02-12
+Last updated: 2026-02-18
+
+> **Detailed tracking:** See [`koi-protocol-alignment-master.md`](./koi-protocol-alignment-master.md) for the full master reference document with test coverage matrix, file references, and phase validation criteria.
 
 ## Purpose
 
@@ -8,14 +10,25 @@ This document compares Octo's current KOI-net implementation with the BlockScien
 
 ## Executive Summary
 
-Octo is currently interoperable with peer nodes running the same practical profile (including Cowichan Valley), but it is not yet fully aligned with strict BlockScience KOI-net semantics.
+Octo is interoperable with peer nodes (Regen, Cowichan Valley) and aligned with BlockScience KOI-net semantics on all high-impact areas. The remaining gaps are medium/low severity (handler chain pipeline, conformance test expansion, protocol surface documentation).
 
-The two highest-impact alignment gaps are:
+**Resolved (P0–P1):**
 
-1. **Identity derivation mismatch**: Octo derives `node_rid` with a truncated key hash (`[:16]`), while the BlockScience reference derives from full key hash material.  
-2. **Security policy mismatch**: Octo allows unsigned fallback requests; BlockScience reference wraps all protocol endpoints in signed-envelope validation.
+1. **Identity derivation** — Node RIDs migrated to `b64_64` (BlockScience canonical `sha256(base64(DER(pubkey)))`, 64 hex chars). Legacy 16-char RIDs still accepted during migration.
+2. **Security policy** — Strict mode available: signed envelope requirement, `target_node == self` enforcement, sender key-RID binding checks. Unsigned fallback controlled by `KOI_STRICT_MODE` flag.
+3. **Manifest hashing** — JCS-canonical via `rid-lib` hard dependency (no fallback). 3 conformance tests with frozen reference vector.
+4. **Bootstrap** — Unknown node self-introduction via FORGET+NEW broadcast with key-RID binding verification.
+5. **Error schema** — BlockScience `ErrorType` mapping with safe fallback (pre-auth errors don't trigger handshake retries).
+6. **POLL edge enforcement** — Unapproved peers receive empty event lists.
 
-Secondary but important gaps include stricter envelope target checks, sender-key-to-RID binding checks, and stronger manifest/content provenance verification.
+**Resolved (P2):**
+
+7. **Conformance tests** — 14 offline + 5 live tests using `koi-net` 1.2.4 as oracle. Wire format roundtrip, signed envelope cross-verification (both directions), node identity cross-verification, and live endpoint validation all pass.
+
+**Resolved (P3–P4):**
+
+8. **Handler chain pipeline** — 5-phase pipeline (`api/pipeline/`) with 7 handlers including `block_self_referential` (BlockScience `basic_rid_handler` parity) and `entity_type_validator`. Feature-flagged via `KOI_USE_PIPELINE=true`, deployed to production.
+9. **Protocol surface cleanup** — Health endpoint reports `pipeline_enabled` from runtime state. Core vs extension endpoints documented. All Definition of Done criteria met.
 
 ## Reference Baseline (BlockScience)
 
@@ -66,9 +79,11 @@ Main differences from strict reference behavior:
 | Signed envelope requirement | Strict envelope handling on protocol endpoints | Signed preferred; unsigned fallback accepted | High (security + interop profile drift) | P0 |
 | Envelope target validation | Reject if `target_node != self` | Not enforced at router boundary | High (replay/misroute risk) | P0 |
 | Sender key ↔ RID binding | Validate node RID hash against sender public key | Signature checked, but no equivalent strict RID-hash binding check¹ | High (identity integrity gap) | P0 |
-| Node RID derivation | Full SHA256 hex digest of DER-encoded public key (64 chars) | Truncated hash suffix (`[:16]`) | High (cross-implementation identity mismatch) | P2² |
-| Manifest canonical hashing | RID manifest/hash semantics with JCS | `rid-lib` dependency present but not consistently used in runtime hashing paths | Medium | P1 |
-| Unknown-node bootstrap | Protocol-level unknown-node handling with handshake behavior | Practical handshake endpoint + self-heal strategy | Medium | P1 |
+| Node RID derivation | Full SHA256 hex digest of base64(DER(pubkey)) (64 chars) | **b64_64 mode added (BlockScience canonical)**; legacy16 still accepted during migration | ~~High~~ → Resolved | P0 ✅ |
+| Manifest canonical hashing | RID manifest/hash semantics with JCS | **rid-lib hard dependency**: `_canonical_sha256_json()` delegates to `rid_sha256_hash_json()`, no fallback. 3 JCS conformance tests with frozen reference vector | ~~Medium~~ → Resolved | P1 ✅ |
+| Unknown-node bootstrap | Protocol-level unknown-node handling with handshake behavior | **Broadcast bootstrap implemented**: unknown nodes self-introduce via NEW event with NodeProfile; key-RID binding verified before trust | ~~Medium~~ → Resolved | P0 ✅ |
+| Error response schema | `ErrorResponse(type="error_response", error=ErrorType)` | **Implemented**: all protocol errors include `type: "error_response"` + BlockScience `ErrorType` mapping | ~~High~~ → Resolved | P0 ✅ |
+| POLL edge enforcement | Unapproved peers get empty results | **Implemented**: `KOI_NET_REQUIRE_APPROVED_EDGE_FOR_POLL` (auto-enabled with strict mode) | ~~Medium~~ → Resolved | P1 ✅ |
 | State sync architecture | Reference cache/effector/handler pipeline | Event queue + cross-reference resolver pipeline | Medium (interop model variance) | P2 |
 | Provenance model | Manifest-centric and broader CAT/provenance direction | Delivery/confirm tracking + cross-refs; limited cryptographic provenance trail | Medium | P2 |
 
@@ -77,21 +92,35 @@ Main differences from strict reference behavior:
 
 ## Alignment Plan (Elegant, Low-Disruption)
 
-## Execution Status (2026-02-12)
+## Execution Status (2026-02-17)
 
 - P0 implemented in Octo:
   - strict-mode policy flags (`KOI_STRICT_MODE` + fine-grained toggles),
   - unsigned-envelope rejection controls (handshake exception preserved),
   - explicit envelope `target_node` enforcement,
   - sender RID/public-key binding checks,
-  - standardized KOI error payloads with `error_code`.
-- P1 partially implemented:
-  - KOI manifest hash fallback now uses `rid-lib` canonical hashing when available.
-  - Full conformance suite against `koi-net` reference remains in progress.
-- P2 pending:
-  - node RID generation remains legacy (`+<16 char hash>`); dual-format validation is enabled for migration safety.
-- P3 in progress:
-  - core-vs-extension endpoint boundaries are now documented in health metadata and docs.
+  - **error response schema**: all protocol errors include `type: "error_response"` + BlockScience `ErrorType` mapping (`unknown_node`, `invalid_key`, `invalid_signature`, `invalid_target`),
+  - **node RID `b64_64` mode**: `sha256(base64(DER(pubkey)))` full 64-char hex — matches BlockScience `sha256_hash(pub_key.to_der())` exactly. Default for new nodes. Legacy16 still accepted during migration via `KOI_ALLOW_LEGACY16_NODE_RID=true`,
+  - **broadcast bootstrap**: unknown nodes can self-introduce via `/events/broadcast` with a `NEW` event carrying `NodeProfile` + `public_key`. Key-RID binding is verified before trusting the new peer,
+  - **POLL edge enforcement**: `KOI_NET_REQUIRE_APPROVED_EDGE_FOR_POLL` (auto-enabled with strict mode) returns empty events for unapproved peers.
+- P1 **complete**:
+  - `rid-lib` is now a hard runtime dependency — `from rid_lib.ext.utils import sha256_hash_json` (no fallback path).
+  - `_canonical_sha256_json()` delegates to `rid_sha256_hash_json()` for all manifest hashing.
+  - 3 JCS conformance tests: float handling (`1.0` → `1`), frozen reference vector from rid-lib 3.2.14, key-order determinism.
+- P2 **complete**:
+  - `test_koi_conformance.py`: 14 offline tests + 5 live tests (19 total) using `koi-net` 1.2.4 as oracle.
+  - Wire format byte-identical between Octo and koi-net for signing input.
+  - Signed envelope cross-verification passes both directions.
+  - Dedicated `venv-conformance/` avoids resolver conflicts (koi-net requires fastapi>=0.115, Octo pins 0.104).
+  - Handler chain pipeline (5-phase: RID → Manifest → Bundle → Network → Final) — now P3.
+- P3 **complete**:
+  - 5-phase handler chain pipeline with 7 handlers (4 RID, 2 Bundle, 1 Final), feature-flagged via `KOI_USE_PIPELINE=true`.
+  - P3b new handlers: `block_self_referential` (BlockScience `basic_rid_handler` parity), `entity_type_validator` (debug logging for unknown types).
+  - 26 pipeline tests passing.
+- P4 **complete**:
+  - `pipeline_enabled` field in health endpoint (runtime state, not env var).
+  - Core vs extension endpoint boundaries documented in health metadata and master doc.
+  - All 5 Definition of Done criteria met.
 
 ### Phase P0: Interop/Security Hardening (no architecture rewrite)
 
