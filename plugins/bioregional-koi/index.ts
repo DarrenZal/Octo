@@ -1,7 +1,23 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 
+import * as nodePath from "node:path";
+
 const KOI_API = process.env.KOI_API_ENDPOINT || "http://127.0.0.1:8351";
-const VAULT_PATH = process.env.OBSIDIAN_VAULT_PATH || "/root/.openclaw/workspace/vault";
+function getVaultPath(): string {
+  const p = process.env.VAULT_PATH;
+  if (!p) throw new Error("VAULT_PATH environment variable must be set");
+  return p;
+}
+
+function safeVaultPath(relativePath: string): string {
+  const vaultRoot = getVaultPath();
+  const resolved = nodePath.resolve(vaultRoot, relativePath);
+  const normalizedVault = nodePath.resolve(vaultRoot);
+  if (!resolved.startsWith(normalizedVault + nodePath.sep) && resolved !== normalizedVault) {
+    throw new Error(`Path traversal rejected: "${relativePath}" resolves outside vault root`);
+  }
+  return resolved;
+}
 
 async function koiRequest(path: string, method = "GET", body?: any) {
   const url = `${KOI_API}${path}`;
@@ -34,15 +50,6 @@ const bioregionalKoiPlugin = {
   id: "bioregional-koi",
   name: "Bioregional KOI",
   description: "Knowledge graph tools for bioregional knowledge commoning",
-  configSchema: {
-    type: "object" as const,
-    additionalProperties: false,
-    properties: {
-      apiEndpoint: { type: "string" as const, default: "http://127.0.0.1:8351" },
-      vaultPath: { type: "string" as const, default: VAULT_PATH },
-    },
-  },
-
   register(api: OpenClawPluginApi) {
     // resolve_entity — disambiguate a name to a canonical entity
     api.registerTool(
@@ -191,8 +198,8 @@ const bioregionalKoiPlugin = {
         async execute(_id: string, params: Record<string, unknown>) {
           const notePath = params.path as string;
           const fs = await import("node:fs/promises");
-          const fullPath = `${VAULT_PATH}/${notePath}`;
           try {
+            const fullPath = safeVaultPath(notePath);
             const content = await fs.readFile(fullPath, "utf-8");
             return { content: [{ type: "text", text: content }] };
           } catch (e: any) {
@@ -221,9 +228,8 @@ const bioregionalKoiPlugin = {
           const notePath = params.path as string;
           const content = params.content as string;
           const fs = await import("node:fs/promises");
-          const path = await import("node:path");
-          const fullPath = `${VAULT_PATH}/${notePath}`;
-          const dir = path.dirname(fullPath);
+          const fullPath = safeVaultPath(notePath);
+          const dir = nodePath.dirname(fullPath);
           await fs.mkdir(dir, { recursive: true });
           await fs.writeFile(fullPath, content, "utf-8");
           return { content: [{ type: "text", text: `Written: ${notePath}` }] };
@@ -248,8 +254,8 @@ const bioregionalKoiPlugin = {
         async execute(_id: string, params: Record<string, unknown>) {
           const folder = params.folder as string;
           const fs = await import("node:fs/promises");
-          const fullPath = `${VAULT_PATH}/${folder}`;
           try {
+            const fullPath = safeVaultPath(folder);
             const files = await fs.readdir(fullPath);
             const mdFiles = files.filter((f: string) => f.endsWith(".md"));
             return { content: [{ type: "text", text: mdFiles.join("\n") }] };
@@ -279,7 +285,7 @@ const bioregionalKoiPlugin = {
         async execute(_id: string, params: Record<string, unknown>) {
           const url = params.url as string;
           const submitted_by = params.submitted_by as string | undefined;
-          const submitted_via = (params.submitted_via as string) || "telegram";
+          const submitted_via = (params.submitted_via as string) || "api";
           const data = await koiRequest("/web/preview", "POST", {
             url,
             submitted_by,
