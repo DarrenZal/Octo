@@ -30,12 +30,10 @@ The [Salish Sea Knowledge Garden](https://github.com/DarrenZal/salish-sea-garden
 [Greater Victoria]   [Cowichan Valley]      ← leaf nodes (bioregional agents)
         ↘                 ↙
    [Octo / Salish Sea Coordinator]         ← federation coordinator
-              ↓
-      [Cascadia Coordinator]               ← future meta-coordinator
-
-                                            [Front Range]
-                                                ↑ separate bioregional network
-                                                (peer of Cascadia, not under it)
+        ↕                 ↓
+   [Front Range]    [Cascadia Coordinator]  ← future meta-coordinator
+   port 8355 (local)     ↑ separate bioregional network
+                         (peer of Cascadia, not under it)
 ```
 
 Each node runs the same KOI API codebase with its own database, vault, and identity. Nodes exchange events via the KOI-net protocol — when a practice is registered in Greater Victoria, it appears as a cross-reference in Octo within seconds.
@@ -49,11 +47,14 @@ Each node runs the same KOI API codebase with its own database, vault, and ident
 ├──────────────────────────────────────────────────┤
 │  Workspace: IDENTITY.md, SOUL.md, KNOWLEDGE.md   │
 ├──────────────────────────────────────────────────┤
-│  bioregional-koi plugin                           │
+│  bioregional-koi plugin (OpenClaw)                 │
 │  ├─ Entity resolution (resolve, register, search) │
 │  ├─ Web content curation (preview_url, ingest_url)│
 │  ├─ Vault read/write                              │
-│  └─ Relationship sync                             │
+│  ├─ Relationship sync                             │
+│  └─ 15 tools per koi-tool-contract                │
+│  OR: MCP server (personal-koi-mcp) — same 15 tools│
+│       for Claude Code / Cursor / MCP hosts         │
 ├──────────────────────────────────────────────────┤
 │  KOI Processor API (uvicorn)                      │
 │  ├─ entity_schema.py  (15 entity types)           │
@@ -78,6 +79,7 @@ Each node runs the same KOI API codebase with its own database, vault, and ident
 |-------|------|----------|----------|---------|
 | **Octo** (Salish Sea) | 8351 | `orn:koi-net.node:octo-salish-sea+50a3c...` | 57 | Enabled (coordinator) |
 | **Greater Victoria** | 37.27.48.12:8351 (remote, poly) | `orn:koi-net.node:greater-victoria+81ec4...` | 4 | Enabled (leaf node) |
+| **Front Range** | 127.0.0.1:8355 (localhost on Octo) | `orn:koi-net.node:front-range+b5429...` | 4 | Enabled (peer node) |
 
 ## BKC Ontology
 
@@ -124,6 +126,10 @@ See [ontology/bkc-ontology.jsonld](ontology/bkc-ontology.jsonld) for the formal 
 │   ├── config/gv.env       # GV-specific env (DB, port, node name)
 │   ├── workspace/          # GV agent identity (IDENTITY.md, SOUL.md)
 │   └── vault/              # GV seed entities (Practices/, Bioregions/)
+├── fr-agent/               # Front Range peer node (deployed on Octo server, port 8355)
+│   ├── config/fr.env       # FR-specific env (DB, port, node name)
+│   ├── workspace/          # FR agent identity (IDENTITY.md, SOUL.md)
+│   └── vault/              # FR seed entities (Practices/, Bioregions/)
 ├── plugins/
 │   └── bioregional-koi/    # OpenClaw plugin connecting to KOI API
 │       ├── openclaw.plugin.json
@@ -169,6 +175,7 @@ See [ontology/bkc-ontology.jsonld](ontology/bkc-ontology.jsonld) for the formal 
 ├── vault-seed/             # Seed entity notes exercising the full predicate chain
 ├── systemd/                # Service definitions
 │   ├── koi-api.service           # Octo (port 8351)
+│   ├── fr-koi-api.service        # Front Range (port 8355)
 │   └── koi-api.service.example  # Template for new leaf nodes
 └── docs/                   # Strategy and implementation plans
     ├── join-the-network.md

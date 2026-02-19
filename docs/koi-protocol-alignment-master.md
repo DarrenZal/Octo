@@ -326,6 +326,7 @@ BlockScience defines `ErrorType` enum (snake_case values):
 | **Octo** | `octo-salish-sea+50a3c9ea...` | `45.132.245.30` | `http://45.132.245.30:8351` (nginx gateway) | Live, coordinator |
 | **GV** | `greater-victoria+81ec47d8...` | `37.27.48.12` (poly) | `http://37.27.48.12:8351` | Live, leaf (remote) |
 | **Regen** | `koi-coordinator-main+c5ca332d...` | BlockScience | `https://regen.gaiaai.xyz/api/koi/coordinator` | Live, federated |
+| **Front Range** | `front-range+b5429ae7...` | `45.132.245.30` (local) | `http://127.0.0.1:8355` (localhost-only) | Live, peer |
 | **Cowichan** | `cowichan-valley+52ae5cd1...` | `202.61.242.194` | `http://202.61.242.194:8351` | Live, leaf |
 
 **Notes:**
@@ -333,6 +334,7 @@ BlockScience defines `ErrorType` enum (snake_case values):
 - The nginx gateway at `45.132.245.30:8351` proxies only `/koi-net/*` and `/health` paths to the internal Octo API.
 - GV migrated from Octo-local (`127.0.0.1:8352`) to remote on poly (`37.27.48.12:8351`) on 2026-02-18. Same keypair, RID preserved.
 - Port 8351 on poly is firewalled via iptables `KOI_FEDERATION` chain — only Octo (`45.132.245.30`) and CV (`202.61.242.194`) are allowed.
+- FR runs on the same host as Octo (localhost:8355), federates bidirectionally with Octo only. External nodes reach FR knowledge through Octo (peer-through-coordinator topology).
 
 ---
 
@@ -685,8 +687,66 @@ BlockScience defines `ErrorType` enum (snake_case values):
 | 2026-02-19 | Old GV decommissioned from Octo server: service, DB, cron removed. Final backups retained. |
 | 2026-02-19 | Automated GV backups on poly: `gv-backup.timer` (daily 3am) + `gv-backup-offhost.timer` (weekly Sun 4am → Octo). Restore tested. |
 | 2026-02-19 | P9: Private key encryption — `PRIV_KEY_PASSWORD` env var, `BestAvailableEncryption`, migration script, 5 tests |
+| 2026-02-19 | Documented dual-implementation tool architecture (OpenClaw plugin + MCP server) and planned commoning-koi-mcp repo split |
+| 2026-02-19 | P9 key encryption deployed to production — GV (poly) and Octo keys encrypted at rest |
+| 2026-02-19 | Front Range agent deployed on Octo server (port 8355, localhost-only). `fr_koi` DB, bidirectional federation with Octo, 4 seed entities |
+| 2026-02-19 | `test-federation.sh` parameterized for multi-source testing (SOURCE_URL, SOURCE_SSH, SOURCE_DB, dynamic node RID filtering) |
 
-### B. Architecture Comparison
+### B. Tool Integration Architecture
+
+The KOI backend exposes a REST API that agent frameworks consume via tool adapters. To ensure behavioral parity across frameworks, tool interfaces are specified in a framework-agnostic **koi-tool-contract** (`koi-processor/docs/koi-tool-contract.md`) — 15 tools covering entity resolution, web content curation, vault operations, relationship sync, and federation queries.
+
+Two implementations of this contract exist:
+
+```
+┌──────────────────────────────────┐     ┌──────────────────────────────────┐
+│  bioregional-koi plugin          │     │  personal-koi-mcp                │
+│  (OpenClaw / TypeScript)         │     │  (MCP server / TypeScript)       │
+│                                  │     │                                  │
+│  15 contract tools               │     │  15 contract tools               │
+│  Deployed on Octo server         │     │  + 27 personal-only tools        │
+│  plugins/bioregional-koi/        │     │  ~/projects/personal-koi-mcp/    │
+│  index.ts                        │     │  (email, sessions, vault ETL)    │
+└──────────┬───────────────────────┘     └──────────┬───────────────────────┘
+           │                                        │
+           │  HTTP calls                            │  HTTP calls
+           ▼                                        ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│                     KOI Processor API (uvicorn)                         │
+│                     Same endpoints, same behavior                       │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+- **`bioregional-koi` plugin** (`plugins/bioregional-koi/index.ts`): Production integration for OpenClaw agents. 15 tools only. Deployed on the Octo server.
+- **`personal-koi-mcp`** (`~/projects/personal-koi-mcp/`): MCP server for Claude Code, Cursor, and other MCP-compatible hosts. Implements the same 15 contract tools plus 27 personal-only tools (email search, session search, vault entity extraction, meeting prep, etc.). Forked from `gaiaaiagent/regen-koi-mcp`. Currently a hybrid personal+BKC system — see "Future: commoning-koi-mcp" below.
+
+Both implementations call the same KOI API endpoints. The contract + 76 contract tests ensure behavioral parity regardless of which framework consumes the tools.
+
+### C. Future: commoning-koi-mcp
+
+When a second node operator needs MCP access to their node (e.g., Front Range), the personal-koi-mcp should be split:
+
+```
+personal-koi-mcp (stays as-is, Darren's personal use)
+├── 15 KOI contract tools (via shared contract spec)
+├── 27 personal tools (email, sessions, meeting prep, entity extraction, etc.)
+└── Personal config (vault path, backend URL)
+
+commoning-koi-mcp (NEW — clean BKC node MCP server)
+├── 15 KOI contract tools only
+├── BKC entity types (15 types from ontology, loaded from backend /entity-types)
+├── Configurable: KOI_API_ENDPOINT, VAULT_PATH, node identity
+└── Deployable on any BKC node (Octo, GV, CV, Front Range)
+```
+
+**Key design decisions:**
+1. **Shared contract, not shared code** — both MCP servers implement `koi-tool-contract.md` independently (same pattern as OpenClaw plugin). No shared npm package needed initially.
+2. **commoning-koi-mcp scope** — only the 15 contract tools. No email, no sessions, no Claude-specific tools.
+3. **Entity types** — loaded dynamically from backend `/entity-types` endpoint (already works this way).
+4. **Configuration** — same 2 env vars: `KOI_API_ENDPOINT` + `VAULT_PATH`. Node identity handled by KOI API, not MCP server.
+5. **When to split** — when a second node operator needs MCP access. Not urgent while only Darren uses MCP.
+
+### E. Architecture Comparison
 
 ```
 BlockScience koi-net                    Octo
@@ -702,7 +762,7 @@ BlockScience koi-net                    Octo
 
 Key architectural difference: Octo uses a **durable database-backed event queue** with per-node delivery tracking (`delivered_to`, `confirmed_by` arrays), while BlockScience uses an in-memory cache with effector pipeline. Octo's approach provides crash-resilient delivery at the cost of additional DB round-trips.
 
-### C. Deployment Commands Reference
+### F. Deployment Commands Reference
 
 ```bash
 # Run pytest tests (policy + pipeline + resolution)
@@ -735,14 +795,14 @@ git -C koi-processor rev-parse --short HEAD | ssh root@45.132.245.30 "cat > /roo
 git -C koi-processor rev-parse --short HEAD | ssh root@37.27.48.12 "cat > /home/koi/koi-processor/.version"
 ```
 
-### D. PyPI Package Adoption Status
+### G. PyPI Package Adoption Status
 
 | Package | Version | Usage | Status |
 |---------|---------|-------|--------|
 | `rid-lib` | `>=3.2.12` (floor) | Hard runtime dependency — JCS hashing | **Active** |
 | `koi-net` | `>=1.2.4` (conformance) | Conformance oracle in `venv-conformance/` — not in runtime deps | **Active (test only)** |
 
-### E. Definition of Done for "Aligned Enough"
+### H. Definition of Done for "Aligned Enough"
 
 The system is considered aligned for production federation when all are true:
 

@@ -1,0 +1,16 @@
+[Unit]
+Description=Front Range KOI API
+After=network.target docker.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/koi-processor
+Environment=PATH=/root/koi-processor/venv/bin:/usr/bin
+EnvironmentFile=/root/fr-agent/config/fr.env
+ExecStart=/root/koi-processor/venv/bin/uvicorn api.personal_ingest_api:app --host 127.0.0.1 --port 8355
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

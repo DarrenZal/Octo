@@ -19,6 +19,7 @@ Octo is a bioregional knowledge commoning agent built on OpenClaw, deployed on a
 | Service | How it runs | Port | Details |
 |---------|------------|------|---------|
 | **Octo KOI API** | systemd (`koi-api.service`) | 8351 (localhost) | uvicorn, Python 3.12, KOI-net enabled |
+| **FR KOI API** | systemd (`fr-koi-api.service`) | 8355 (localhost) | Front Range peer node, localhost-only |
 | **KOI Federation Gateway** | nginx (`octo-koi-net-8351`) | 8351 (public IP) | Proxies only `/koi-net/*` and `/health` to Octo API |
 | **GV KOI API** | **Remote** on `37.27.48.12` (poly) | 8351 (public) | Greater Victoria leaf node, migrated 2026-02-18 |
 | **PostgreSQL** | Docker (`regen-koi-postgres`) | 5432 (localhost) | pgvector + Apache AGE, multiple DBs |
@@ -34,11 +35,13 @@ Legacy `legacy16` RIDs (16 hex chars) still accepted during migration via `KOI_A
 | Node | Node RID | Public Key (truncated) |
 |------|----------|----------------------|
 | **Octo** | `orn:koi-net.node:octo-salish-sea+50a3c9eac05c807f7f0ad114aad3b50b67bbbe1015664e39988f967f9ef4502b` | `MFkwEwYH...` |
+| **FR** | `orn:koi-net.node:front-range+b5429ae7981decb0ddf5a45551b176846e6121f964543259eccf4a0a1a6ff21c` | `MFkwEwYH...` |
 | **GV** | `orn:koi-net.node:greater-victoria+81ec47d80f2314449b0f4342c087eb91dabf7811fc2d846233c389ef2b0b6f58` | `MFkwEwYH...` |
 
 > **RID migration complete (2026-02-18):** Node RIDs migrated from legacy16 (16-char) to b64_64 (64-char BlockScience canonical). Same keypairs, full SHA-256 hash suffix.
 
 Octo's key: `/root/koi-state/octo-salish-sea_private_key.pem` (on 45.132.245.30).
+FR's key: `/root/koi-state/front-range_private_key.pem` (on 45.132.245.30).
 GV's key: `/home/koi/koi-state/greater-victoria_private_key.pem` (on poly 37.27.48.12).
 
 ## File Layout on Server
@@ -72,6 +75,15 @@ GV's key: `/home/koi/koi-state/greater-victoria_private_key.pem` (on poly 37.27.
 │   │   └── test_koi_interop.py      # KOI-net protocol interop tests
 │   ├── requirements.txt
 │   └── venv/                        # Python virtualenv
+├── fr-agent/                   # Front Range peer node (port 8355, localhost-only)
+│   ├── config/
+│   │   └── fr.env
+│   ├── workspace/
+│   │   ├── IDENTITY.md
+│   │   └── SOUL.md
+│   └── vault/
+│       ├── Bioregions/
+│       └── Practices/
 ├── gv-agent/                   # Greater Victoria (LEGACY local copy — deployed on poly at /home/koi/)
 ├── koi-state/                  # Node identity keys
 │   └── octo-salish-sea_private_key.pem
@@ -285,6 +297,7 @@ Octo's databases are in the local PostgreSQL container (`regen-koi-postgres`). G
 | Database | Agent | Host | Entities |
 |----------|-------|------|----------|
 | `octo_koi` | Octo (Salish Sea) | `45.132.245.30` (local) | 70 |
+| `fr_koi` | Front Range | `45.132.245.30` (local) | 4 |
 | `gv_koi` | Greater Victoria | `37.27.48.12` (poly, port 5433) | 5 |
 
 ### Key tables (per database)
@@ -354,6 +367,7 @@ The source files in this repo map to server paths:
 | `docker/` | `/root/koi-stack/` |
 | `scripts/` | `/root/scripts/` |
 | `systemd/` | `/etc/systemd/system/` |
+| `fr-agent/` | `/root/fr-agent/` (on `45.132.245.30`) |
 | `gv-agent/` | `/home/koi/gv-agent/` (on poly `37.27.48.12`) |
 | `workspace/` | `/root/.openclaw/workspace/` |
 | `plugins/bioregional-koi/` | `/root/bioregional-koi/` |
@@ -372,7 +386,7 @@ The source files in this repo map to server paths:
 | Path | What |
 |------|------|
 | `~/projects/regenai/koi-processor/` | Full KOI processor (superset of what's deployed here) |
-| `~/projects/personal-koi-mcp/` | Personal KOI MCP server (TypeScript) |
+| `~/projects/personal-koi-mcp/` | KOI MCP server (TypeScript). Implements the `koi-tool-contract` (15 tools) + 27 personal-only tools (email search, sessions, vault ETL, meeting prep). Currently a hybrid personal+BKC system — the 15 contract tools are identical to what `plugins/bioregional-koi/` provides for OpenClaw. Future plan: split into `commoning-koi-mcp` (15 contract tools only, deployable on any BKC node) + keep personal tools here. See `docs/koi-protocol-alignment-master.md` §8C. |
 | `~/Documents/Notes/Ontology/` | Local vault ontology schemas |
 
 ## Current Status
@@ -384,7 +398,8 @@ The source files in this repo map to server paths:
 - Sprints 1-3 deployed: KOI-net federation working between Octo (coordinator) and GV (leaf)
 - **GV migrated to remote server** (2026-02-18): `37.27.48.12` (poly), port 8351, user `koi`, own PostgreSQL container (port 5433). Same keypair, RID preserved. 3-node topology: Octo + GV (remote) + CV (Shawn)
 - **Old GV decommissioned** (2026-02-19): Removed gv-koi-api service, gv_koi DB, /root/gv-agent/, and old private key from 45.132.245.30. Final backups: `/root/backups/gv_koi_final_20260219.sql.gz` + `gv_agent_final_20260219.tar.gz`
-- P0-P9 protocol alignment complete (98 tests, deployed)
+- P0-P9 protocol alignment complete (98 tests, deployed), keys encrypted at rest (P9)
+- **Front Range agent deployed** (2026-02-19): `127.0.0.1:8355` on Octo server, `fr_koi` DB, bidirectional federation with Octo, localhost-only (peer through coordinator topology)
 - Node RID migration to b64_64 (BlockScience canonical) complete
 - 70 entities in Octo across 14 types, seeded via `seed-vault-entities.sh`
 - Cross-reference resolution verified: Herring Monitoring = `same_as` (confidence 1.0)
@@ -405,13 +420,9 @@ The source files in this repo map to server paths:
 - **Backups:** `gv-backup.timer` (daily 3am), `gv-backup-offhost.timer` (weekly Sun 4am → Octo). See Backups section.
 
 ### What's Left
-1. **Front Range agent** — create agent dir, database, workspace, systemd, edges
-2. **Phase 5.7: GitHub sensor** — adapt for self-knowledge
-3. **Phase 0.5: BKC CoIP vault audit** — blocked on access from Andrea Farias / Vincent Arena
-4. **Phase 5: Cascadia coordinator** — after CV is running, proves holon pattern
-
-### Open Questions
-- Front Range: connect to Octo directly for now (since Cascadia doesn't exist yet) or wait?
+1. **Phase 5.7: GitHub sensor** — adapt for self-knowledge
+2. **Phase 0.5: BKC CoIP vault audit** — blocked on access from Andrea Farias / Vincent Arena
+3. **Phase 5: Cascadia coordinator** — after CV is running, proves holon pattern
 
 ### Adding a New Agent (Quick Reference)
 
