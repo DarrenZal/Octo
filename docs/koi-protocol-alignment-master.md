@@ -693,6 +693,7 @@ BlockScience defines `ErrorType` enum (snake_case values):
 | 2026-02-19 | `test-federation.sh` parameterized for multi-source testing (SOURCE_URL, SOURCE_SSH, SOURCE_DB, dynamic node RID filtering) |
 | 2026-02-19 | Commit `9ea1e11`: P9 key encryption deployed to all 3 nodes (Octo, GV, FR). Front Range agent fully deployed (DB, edges, seeded, key encrypted, federation verified). `test-federation.sh` parameterized for multi-source. All docs updated. |
 | 2026-02-19 | `gv.env` completed with KOI-net federation vars (previously worked because server env had them, but repo file was incomplete) |
+| 2026-02-19 | Phase 5.7: GitHub sensor activated on Octo server — 4 repos (Octo, openclaw, koi-net, personal-koi-mcp), 35k+ code artifacts, tree-sitter Python/TS extraction, vault notes in Sources/GitHub/ |
 
 ### B. Tool Integration Architecture
 
@@ -849,10 +850,10 @@ The system is considered aligned for production federation when all are true:
 - [x] **Automated GV backups** on poly — daily + weekly off-host to Octo
 - [x] **Cowichan Valley SSH access** obtained — `ssh root@202.61.242.194` (Shawn's node)
 - [x] **gv.env completed** with KOI-net federation vars (KOI_NET_ENABLED, KOI_STATE_DIR, KOI_BASE_URL, security flags)
+- [x] **Phase 5.7: GitHub sensor activated** — 4 repos (Octo, openclaw, koi-net, personal-koi-mcp), 35k+ code artifacts, tree-sitter extraction, vault notes in Sources/GitHub/
 
 ### Active Next Steps (priority order)
 
-1. **Phase 5.7: GitHub sensor** — Adapt for self-knowledge (Octo watches its own repos)
-2. **Phase 0.5: BKC CoIP vault audit** — Blocked on access from Andrea Farias / Vincent Arena
-3. **Phase 5: Cascadia coordinator** — After CV is fully operational, proves holon pattern
-4. **commoning-koi-mcp split** — When a second node operator needs MCP access (see §8C)
+1. **Phase 0.5: BKC CoIP vault audit** — Blocked on access from Andrea Farias / Vincent Arena
+2. **Phase 5: Cascadia coordinator** — After CV is fully operational, proves holon pattern
+3. **commoning-koi-mcp split** — When a second node operator needs MCP access (see §8C)

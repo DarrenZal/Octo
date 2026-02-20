@@ -404,6 +404,7 @@ The source files in this repo map to server paths:
 - 70 entities in Octo across 14 types, seeded via `seed-vault-entities.sh`
 - Cross-reference resolution verified: Herring Monitoring = `same_as` (confidence 1.0)
 - Cowichan Valley (Shawn's node) live at `202.61.242.194:8351`
+- **Phase 5.7: GitHub sensor activated** (2026-02-19): 4 repos (Octo, openclaw, koi-net, personal-koi-mcp), 35k+ code artifacts, tree-sitter Python/TS extraction, vault notes in `Sources/GitHub/`, 6-hour auto-scan interval
 
 ### GV Remote Node (poly)
 - **Host:** `37.27.48.12` (poly server, shared with AlgoTrading)
@@ -420,9 +421,8 @@ The source files in this repo map to server paths:
 - **Backups:** `gv-backup.timer` (daily 3am), `gv-backup-offhost.timer` (weekly Sun 4am → Octo). See Backups section.
 
 ### What's Left
-1. **Phase 5.7: GitHub sensor** — adapt for self-knowledge
-2. **Phase 0.5: BKC CoIP vault audit** — blocked on access from Andrea Farias / Vincent Arena
-3. **Phase 5: Cascadia coordinator** — after CV is running, proves holon pattern
+1. **Phase 0.5: BKC CoIP vault audit** — blocked on access from Andrea Farias / Vincent Arena
+2. **Phase 5: Cascadia coordinator** — after CV is running, proves holon pattern
 
 ### Adding a New Agent (Quick Reference)
 
