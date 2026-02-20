@@ -857,3 +857,4 @@ The system is considered aligned for production federation when all are true:
 1. **Phase 0.5: BKC CoIP vault audit** — Blocked on access from Andrea Farias / Vincent Arena
 2. **Phase 5: Cascadia coordinator** — After CV is fully operational, proves holon pattern
 3. **commoning-koi-mcp split** — When a second node operator needs MCP access (see §8C)
+4. **PicoClaw pilot evaluation (exploratory)** — Assess feasibility for ultra-light edge/sensor leaf nodes; no committed integration path yet

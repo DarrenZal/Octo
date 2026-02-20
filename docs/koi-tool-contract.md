@@ -255,6 +255,18 @@ extra_hosts:
 
 Expand to full 15 once these 3 are confirmed working.
 
+## PicoClaw (Exploratory)
+
+PicoClaw is a candidate runtime for ultra-light edge/sensor nodes in the BKC
+network. This is exploratory only: no official integration or support path is
+defined yet.
+
+Current stance:
+- Keep Octo on OpenClaw as coordinator
+- Use NanoClaw/MCP for near-term portability
+- Evaluate PicoClaw as a future pilot for low-resource sensor leaf nodes that
+  publish into KOI-net
+
 ## Changelog
 
 - **v1.1.1** (2026-02-18): Verification & closeout
