@@ -692,6 +692,7 @@ BlockScience defines `ErrorType` enum (snake_case values):
 | 2026-02-19 | Front Range agent deployed on Octo server (port 8355, localhost-only). `fr_koi` DB, bidirectional federation with Octo, 4 seed entities |
 | 2026-02-19 | `test-federation.sh` parameterized for multi-source testing (SOURCE_URL, SOURCE_SSH, SOURCE_DB, dynamic node RID filtering) |
 | 2026-02-19 | Commit `9ea1e11`: P9 key encryption deployed to all 3 nodes (Octo, GV, FR). Front Range agent fully deployed (DB, edges, seeded, key encrypted, federation verified). `test-federation.sh` parameterized for multi-source. All docs updated. |
+| 2026-02-19 | `gv.env` completed with KOI-net federation vars (previously worked because server env had them, but repo file was incomplete) |
 
 ### B. Tool Integration Architecture
 
@@ -847,11 +848,11 @@ The system is considered aligned for production federation when all are true:
 - [x] **Old GV decommissioned** from Octo server — service, DB, cron removed; final backups retained
 - [x] **Automated GV backups** on poly — daily + weekly off-host to Octo
 - [x] **Cowichan Valley SSH access** obtained — `ssh root@202.61.242.194` (Shawn's node)
+- [x] **gv.env completed** with KOI-net federation vars (KOI_NET_ENABLED, KOI_STATE_DIR, KOI_BASE_URL, security flags)
 
 ### Active Next Steps (priority order)
 
-1. **GV env cleanup** — Make `gv.env` complete (add missing KOI-net federation vars; works because server env has them, but repo file is incomplete)
-2. **Phase 5.7: GitHub sensor** — Adapt for self-knowledge (Octo watches its own repos)
-3. **Phase 0.5: BKC CoIP vault audit** — Blocked on access from Andrea Farias / Vincent Arena
-4. **Phase 5: Cascadia coordinator** — After CV is fully operational, proves holon pattern
-5. **commoning-koi-mcp split** — When a second node operator needs MCP access (see §8C)
+1. **Phase 5.7: GitHub sensor** — Adapt for self-knowledge (Octo watches its own repos)
+2. **Phase 0.5: BKC CoIP vault audit** — Blocked on access from Andrea Farias / Vincent Arena
+3. **Phase 5: Cascadia coordinator** — After CV is fully operational, proves holon pattern
+4. **commoning-koi-mcp split** — When a second node operator needs MCP access (see §8C)
