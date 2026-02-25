@@ -17,6 +17,14 @@
     - `POST /koi-net/commons/intake/decide`
   - Poller share persistence updates already present in this branch are compatible with above.
 
+## Status Update (2026-02-25)
+- Tunnel-free federation over WireGuard validated across Darren, Octo, Front Range, and Cowichan.
+- Commons intake flow validated live (`staged -> approved/rejected`) on Octo and Cowichan.
+- Poller hardening applied:
+  - replaced failure-threshold skip behavior with time-based retry windows,
+  - automatic peer recovery after outage without requiring service restart,
+  - deployed to Octo/FR/Cowichan runtime nodes.
+
 ## New Migrations Added
 - `048_event_target_node.sql`
 - `049_peer_aliases.sql`
@@ -30,13 +38,13 @@
 - `RegenAI/koi-processor`: reference implementation used for parity checks.
 
 ## Next Session Bring-Up Checklist
-1. Apply migrations 048-052 in the target Octo DB.
+1. Ensure migrations 048-052 are applied in the target DB.
 2. Ensure env flags:
    - `KOI_NET_ENABLED=true`
    - `KOI_NET_REQUIRE_APPROVED_EDGE_FOR_POLL=true`
    - `KOI_ENFORCE_SOURCE_KEY_RID_BINDING=true`
    - `KOI_COMMONS_INTAKE_ENABLED=true` (for commons mode)
-3. Restart API/poller.
+3. Restart API/poller after deployment.
 4. Smoke:
    - `GET /koi-net/health`
    - handshake between peers

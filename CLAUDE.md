@@ -287,6 +287,9 @@ ssh root@45.132.245.30 "docker exec regen-koi-postgres psql -U postgres -d octo_
   - Poller now retries with handshake automatically; if it persists, upsert peer `public_key` in `koi_net_nodes`.
 - Poller runs but never polls peers:
   - Edge is flipped. For POLL, `target_node` must equal self.
+- Poller appears "stuck" after prior peer outage:
+  - Poller now uses time-based backoff (30s, 60s, 120s... capped at 600s) and should auto-recover without restart.
+  - Watch for `POLL recovered for <node_rid> after <n> consecutive failures` in logs.
 - `404` on `/koi-net/poll`:
   - Use `/koi-net/events/poll` (legacy path removed).
 - Peer cannot reach Octo:
@@ -390,6 +393,7 @@ The source files in this repo map to server paths:
 | `~/projects/regenai/koi-processor/` | Full KOI processor (superset of what's deployed here) |
 | `~/projects/personal-koi-mcp/` | KOI MCP server (TypeScript). Implements the `koi-tool-contract` (15 tools) + 27 personal-only tools (email search, sessions, vault ETL, meeting prep). Currently a hybrid personal+BKC system — the 15 contract tools are identical to what `plugins/bioregional-koi/` provides for OpenClaw. Future plan: split into `commoning-koi-mcp` (15 contract tools only, deployable on any BKC node) + keep personal tools here. See `docs/koi-protocol-alignment-master.md` §8C. |
 | `~/Documents/Notes/Ontology/` | Local vault ontology schemas |
+| `~/projects/BioregionKnwoledgeCommons/bioregional-commons-web/` | Web dashboard (Next.js). Forked from `omniharmonic/bioregionalknowledgecommons`. BFF API routes proxy to all 4 KOI nodes server-side. 3D globe with live node health, federation arcs, entity browser. Designed to run on Octo server (Option A) where it can reach all nodes directly. |
 
 ## Current Status
 

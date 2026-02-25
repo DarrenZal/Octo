@@ -19,7 +19,7 @@ import asyncio
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 import asyncpg
@@ -89,6 +89,8 @@ class KOIPoller:
         self._running = False
         self._backoff: Dict[str, int] = {}  # node_rid -> consecutive failures (POLL)
         self._webhook_backoff: Dict[str, int] = {}  # node_rid -> consecutive failures (WEBHOOK)
+        self._next_poll_retry_at: Dict[str, datetime] = {}  # node_rid -> next allowed retry time
+        self._next_webhook_retry_at: Dict[str, datetime] = {}  # node_rid -> next allowed retry time
 
     async def start(self):
         """Start the background polling task."""
@@ -106,6 +108,75 @@ class KOIPoller:
             except asyncio.CancelledError:
                 pass
         logger.info("Poller stopped")
+
+    @staticmethod
+    def _compute_backoff_seconds(failures: int) -> int:
+        """Exponential backoff with an upper bound."""
+        return min(30 * (2 ** max(failures - 1, 0)), MAX_BACKOFF)
+
+    def _should_skip_for_backoff(
+        self,
+        node_rid: str,
+        failures_map: Dict[str, int],
+        retry_at_map: Dict[str, datetime],
+        channel: str,
+    ) -> bool:
+        """Return True if node is still cooling down before next retry."""
+        retry_at = retry_at_map.get(node_rid)
+        if retry_at is None:
+            return False
+        now = datetime.now(timezone.utc)
+        if retry_at <= now:
+            retry_at_map.pop(node_rid, None)
+            return False
+        remaining = max(1, int((retry_at - now).total_seconds()))
+        logger.debug(
+            "%s backoff active for %s: %ss remaining (failures=%s)",
+            channel,
+            node_rid,
+            remaining,
+            failures_map.get(node_rid, 0),
+        )
+        return True
+
+    def _record_failure(
+        self,
+        node_rid: str,
+        failures_map: Dict[str, int],
+        retry_at_map: Dict[str, datetime],
+        channel: str,
+        message: str,
+    ) -> None:
+        """Increment failure count and schedule next retry time."""
+        failures = failures_map.get(node_rid, 0) + 1
+        failures_map[node_rid] = failures
+        backoff_seconds = self._compute_backoff_seconds(failures)
+        retry_at_map[node_rid] = datetime.now(timezone.utc) + timedelta(seconds=backoff_seconds)
+        logger.warning(
+            "%s (%s failure #%s, next retry in %ss)",
+            message,
+            channel,
+            failures,
+            backoff_seconds,
+        )
+
+    def _record_success(
+        self,
+        node_rid: str,
+        failures_map: Dict[str, int],
+        retry_at_map: Dict[str, datetime],
+        channel: str,
+    ) -> None:
+        """Clear backoff state on successful exchange."""
+        previous_failures = failures_map.pop(node_rid, 0)
+        retry_at_map.pop(node_rid, None)
+        if previous_failures > 0:
+            logger.info(
+                "%s recovered for %s after %s consecutive failures",
+                channel,
+                node_rid,
+                previous_failures,
+            )
 
     async def _poll_loop(self):
         """Main polling loop."""
@@ -144,15 +215,13 @@ class KOIPoller:
                 logger.warning(f"No base_url for {source_node}, skipping")
                 continue
 
-            # Check backoff
-            failures = self._backoff.get(source_node, 0)
-            if failures > 0:
-                backoff_time = min(30 * (2 ** (failures - 1)), MAX_BACKOFF)
-                logger.debug(f"Backoff for {source_node}: {backoff_time}s (failures={failures})")
-                # Skip this cycle if still in backoff
-                # (simplified: we just skip, the sleep handles timing)
-                if failures > 3:
-                    continue
+            if self._should_skip_for_backoff(
+                source_node,
+                self._backoff,
+                self._next_poll_retry_at,
+                "POLL",
+            ):
+                continue
 
             try:
                 await self._poll_peer(
@@ -161,16 +230,28 @@ class KOIPoller:
                     rid_types=edge["rid_types"],
                     peer_public_key_b64=edge["public_key"],
                 )
-                # Reset backoff on success
-                self._backoff[source_node] = 0
+                self._record_success(
+                    source_node,
+                    self._backoff,
+                    self._next_poll_retry_at,
+                    "POLL",
+                )
             except httpx.ConnectError:
-                self._backoff[source_node] = failures + 1
-                logger.warning(
-                    f"Peer {source_node} unreachable (failure #{failures + 1})"
+                self._record_failure(
+                    source_node,
+                    self._backoff,
+                    self._next_poll_retry_at,
+                    "POLL",
+                    f"Peer {source_node} unreachable",
                 )
             except Exception as e:
-                self._backoff[source_node] = failures + 1
-                logger.warning(f"Poll failed for {source_node}: {e}")
+                self._record_failure(
+                    source_node,
+                    self._backoff,
+                    self._next_poll_retry_at,
+                    "POLL",
+                    f"Poll failed for {source_node}: {e}",
+                )
 
     async def _push_webhook_peers(self):
         """Push events to WEBHOOK subscribers."""
@@ -195,11 +276,12 @@ class KOIPoller:
             if not base_url:
                 continue
 
-            # Check backoff
-            failures = self._webhook_backoff.get(target_node, 0)
-            if failures > 3:
-                backoff_time = min(30 * (2 ** (failures - 1)), MAX_BACKOFF)
-                logger.debug(f"WEBHOOK backoff for {target_node}: {backoff_time}s (failures={failures})")
+            if self._should_skip_for_backoff(
+                target_node,
+                self._webhook_backoff,
+                self._next_webhook_retry_at,
+                "WEBHOOK",
+            ):
                 continue
 
             # Phase 1: Peek (no side effects)
@@ -244,15 +326,27 @@ class KOIPoller:
                                     expected_target_node=self.node_rid,
                                 )
                             except EnvelopeError as e:
-                                self._webhook_backoff[target_node] = failures + 1
-                                logger.warning(
-                                    f"WEBHOOK push to {target_node}: response verification failed after key refresh: {e}"
+                                self._record_failure(
+                                    target_node,
+                                    self._webhook_backoff,
+                                    self._next_webhook_retry_at,
+                                    "WEBHOOK",
+                                    (
+                                        "WEBHOOK push to "
+                                        f"{target_node}: response verification failed after key refresh: {e}"
+                                    ),
                                 )
                                 continue
                         else:
-                            self._webhook_backoff[target_node] = failures + 1
-                            logger.warning(
-                                f"WEBHOOK push to {target_node}: response verification failed, key refresh unsuccessful"
+                            self._record_failure(
+                                target_node,
+                                self._webhook_backoff,
+                                self._next_webhook_retry_at,
+                                "WEBHOOK",
+                                (
+                                    "WEBHOOK push to "
+                                    f"{target_node}: response verification failed, key refresh unsuccessful"
+                                ),
                             )
                             continue
 
@@ -263,7 +357,12 @@ class KOIPoller:
                         event_ids = [e["event_id"] for e in events]
                         await self.event_queue.mark_delivered(event_ids, target_node)
                         logger.info(f"WEBHOOK push to {target_node}: {len(events)} events delivered")
-                        self._webhook_backoff[target_node] = 0
+                        self._record_success(
+                            target_node,
+                            self._webhook_backoff,
+                            self._next_webhook_retry_at,
+                            "WEBHOOK",
+                        )
                     else:
                         # Partial or zero success: mark NONE, retry all next cycle
                         logger.warning(
@@ -271,15 +370,30 @@ class KOIPoller:
                             f"marking none delivered, will retry all"
                         )
                 else:
-                    self._webhook_backoff[target_node] = failures + 1
-                    logger.warning(f"WEBHOOK push to {target_node} failed: HTTP {resp.status_code}")
+                    self._record_failure(
+                        target_node,
+                        self._webhook_backoff,
+                        self._next_webhook_retry_at,
+                        "WEBHOOK",
+                        f"WEBHOOK push to {target_node} failed: HTTP {resp.status_code}",
+                    )
 
             except httpx.ConnectError:
-                self._webhook_backoff[target_node] = failures + 1
-                logger.warning(f"WEBHOOK push to {target_node}: connection failed")
+                self._record_failure(
+                    target_node,
+                    self._webhook_backoff,
+                    self._next_webhook_retry_at,
+                    "WEBHOOK",
+                    f"WEBHOOK push to {target_node}: connection failed",
+                )
             except Exception as e:
-                self._webhook_backoff[target_node] = failures + 1
-                logger.warning(f"WEBHOOK push to {target_node} error: {e}")
+                self._record_failure(
+                    target_node,
+                    self._webhook_backoff,
+                    self._next_webhook_retry_at,
+                    "WEBHOOK",
+                    f"WEBHOOK push to {target_node} error: {e}",
+                )
 
     async def _learn_peer_public_key(
         self,

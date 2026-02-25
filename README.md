@@ -226,6 +226,7 @@ Enable federation by setting `KOI_NET_ENABLED=true` in the agent's env file. Thi
 - Protocol endpoints at `/koi-net/*` (handshake, poll, broadcast, confirm, etc.)
 - ECDSA P-256 signed envelopes for authenticated communication
 - Background poller for event-driven cross-reference creation
+- Time-based exponential retry backoff with automatic recovery when peers come back online (no service restart required)
 - Auto-generated node identity (keypair stored in `/root/koi-state/`)
 
 Federation readiness checklist (critical):

@@ -267,7 +267,10 @@ BlockScience defines `ErrorType` enum (snake_case values):
 **File:** `koi_poller.py`
 
 - Async background task with `asyncio.create_task()` (`koi_poller.py:80`)
-- Exponential backoff: `min(30 * 2^(failures-1), 600)` seconds (`koi_poller.py:133`)
+- Time-based exponential backoff with retry windows:
+  - `min(30 * 2^(failures-1), 600)` seconds
+  - tracked per peer as `next_retry_at` (POLL and WEBHOOK separately)
+  - automatic recovery once retry window elapses and peer becomes reachable (no restart required)
 - Self-healing handshake: on "No public key for" error, sends handshake then retries once (`koi_poller.py:272-284`)
 - Peer key learning from `/koi-net/health` endpoint (`koi_poller.py:262-310`)
 - Signed request/response support with policy enforcement (`koi_poller.py:47-54`)
@@ -687,6 +690,8 @@ BlockScience defines `ErrorType` enum (snake_case values):
 | 2026-02-19 | Old GV decommissioned from Octo server: service, DB, cron removed. Final backups retained. |
 | 2026-02-19 | Automated GV backups on poly: `gv-backup.timer` (daily 3am) + `gv-backup-offhost.timer` (weekly Sun 4am → Octo). Restore tested. |
 | 2026-02-19 | P9: Private key encryption — `PRIV_KEY_PASSWORD` env var, `BestAvailableEncryption`, migration script, 5 tests |
+| 2026-02-20 | `/koi-net/edges` read-only endpoint added to `koi_net_router.py`, deployed to Octo. Returns approved federation edges for dashboard visualization. |
+| 2026-02-20 | Web dashboard forked (`BioregionalKnowledgeCommons/bioregional-commons-web`). Next.js BFF proxies all 4 KOI nodes server-side. Live node markers (health-colored), federation arcs, entity browser, rate-limited search. Designed to run on Octo server (Option A). |
 | 2026-02-19 | Documented dual-implementation tool architecture (OpenClaw plugin + MCP server) and planned commoning-koi-mcp repo split |
 | 2026-02-19 | P9 key encryption deployed to production — GV (poly) and Octo keys encrypted at rest |
 | 2026-02-19 | Front Range agent deployed on Octo server (port 8355, localhost-only). `fr_koi` DB, bidirectional federation with Octo, 4 seed entities |
@@ -851,6 +856,7 @@ The system is considered aligned for production federation when all are true:
 - [x] **Cowichan Valley SSH access** obtained — `ssh root@202.61.242.194` (Shawn's node)
 - [x] **gv.env completed** with KOI-net federation vars (KOI_NET_ENABLED, KOI_STATE_DIR, KOI_BASE_URL, security flags)
 - [x] **Phase 5.7: GitHub sensor activated** — 4 repos (Octo, openclaw, koi-net, personal-koi-mcp), 35k+ code artifacts, tree-sitter extraction, vault notes in Sources/GitHub/
+- [x] **Bioregion onboarding kit** — `docs/new-bioregion-quickstart.md`, `vault-seed/TEMPLATES/` (Practice + Bioregion templates), fixed `involves_organization` → `parentOrg` in `join-the-network.md`
 
 ### Active Next Steps (priority order)
 

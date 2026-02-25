@@ -1038,7 +1038,7 @@ name: Garry Oak Ecosystem Restoration
 description: Community-led restoration of Garry oak meadow ecosystems on Vancouver Island
 bioregion:
   - "[[Bioregions/Cowichan Valley]]"
-involves_organization:
+parentOrg:
   - "[[Organizations/Cowichan Land Trust]]"
 activityStatus: alive
 tags:
