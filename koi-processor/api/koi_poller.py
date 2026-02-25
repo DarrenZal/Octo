@@ -59,6 +59,8 @@ REQUIRE_SIGNED_RESPONSES = _bool_env(
     "KOI_REQUIRE_SIGNED_RESPONSES",
     _bool_env("KOI_STRICT_MODE", False),
 )
+COMMONS_INTAKE_ENABLED = _bool_env("KOI_COMMONS_INTAKE_ENABLED", False)
+COMMONS_AUTO_APPROVE = _bool_env("KOI_COMMONS_AUTO_APPROVE", False)
 
 
 class KOIPoller:
@@ -314,6 +316,19 @@ class KOIPoller:
         ontology_uri = node.get("ontology_uri")
         ontology_version = node.get("ontology_version")
         async with self.pool.acquire() as conn:
+            # Key pinning: reject silent key rotation
+            existing_key = await conn.fetchval(
+                "SELECT public_key FROM koi_net_nodes WHERE node_rid = $1",
+                source_node,
+            )
+            if existing_key and existing_key != public_key:
+                logger.warning(
+                    "KEY MISMATCH for %s — pinned key starts with: %s... new key starts with: %s... "
+                    "Refusing to update and skipping this peer.",
+                    source_node, existing_key[:20], public_key[:20],
+                )
+                return None
+
             await conn.execute(
                 """
                 INSERT INTO koi_net_nodes
@@ -324,7 +339,6 @@ class KOIPoller:
                     node_name = EXCLUDED.node_name,
                     node_type = EXCLUDED.node_type,
                     base_url = EXCLUDED.base_url,
-                    public_key = EXCLUDED.public_key,
                     ontology_uri = COALESCE(EXCLUDED.ontology_uri, koi_net_nodes.ontology_uri),
                     ontology_version = COALESCE(EXCLUDED.ontology_version, koi_net_nodes.ontology_version),
                     status = 'active',
@@ -460,6 +474,7 @@ class KOIPoller:
             rid = event.get("rid")
             event_type = event.get("event_type", "NEW")
             contents = event.get("contents", {})
+            manifest = event.get("manifest")
 
             if not rid:
                 continue
@@ -469,7 +484,9 @@ class KOIPoller:
                     rid=rid,
                     event_type=event_type,
                     contents=contents,
+                    manifest=manifest,
                     source_node=source_node,
+                    event_id=event_id,
                 )
                 if event_id:
                     confirm_batch.append(event_id)
@@ -490,12 +507,50 @@ class KOIPoller:
         rid: str,
         event_type: str,
         contents: Dict[str, Any],
+        manifest: Optional[Dict[str, Any]],
         source_node: str,
+        event_id: Optional[str] = None,
     ):
         """Process a single event from a peer.
 
         Resolves the entity and creates a cross-reference.
         """
+        share_meta = contents.get("_koi_share_meta", {}) if isinstance(contents, dict) else {}
+        recipient_type = (
+            share_meta.get("recipient_type")
+            if isinstance(share_meta, dict)
+            else None
+        ) or ((manifest or {}).get("recipient_type") if isinstance(manifest, dict) else None) or "peer"
+        recipient_type = str(recipient_type).strip().lower()
+        is_commons_share = recipient_type == "commons"
+        is_staged_commons_intake = (
+            event_type != "FORGET"
+            and is_commons_share
+            and COMMONS_INTAKE_ENABLED
+            and not COMMONS_AUTO_APPROVE
+        )
+
+        # Persist inbound shares for receiver UX/intake flow.
+        # FORGET is always persisted as retraction (marker may be absent).
+        if contents.get("_koi_share") or event_type == "FORGET":
+            await self._persist_shared_document(
+                rid=rid,
+                event_type=event_type,
+                contents=contents,
+                manifest=manifest,
+                source_node=source_node,
+                event_id=event_id,
+                recipient_type=recipient_type,
+                intake_status="staged" if is_staged_commons_intake else None,
+            )
+            if is_staged_commons_intake:
+                logger.info(
+                    "Staged commons share %s from %s for manual intake approval",
+                    rid,
+                    source_node,
+                )
+                return
+
         if self.pipeline and self.use_pipeline:
             from api.pipeline import KnowledgeObject
             kobj = KnowledgeObject(
@@ -587,6 +642,100 @@ class KOIPoller:
         logger.info(
             f"Cross-ref: {rid} -> {local_uri} ({relationship}, conf={confidence})"
         )
+
+    async def _persist_shared_document(
+        self,
+        rid: str,
+        event_type: str,
+        contents: Dict[str, Any],
+        manifest: Optional[Dict[str, Any]],
+        source_node: str,
+        event_id: Optional[str] = None,
+        recipient_type: str = "peer",
+        intake_status: Optional[str] = None,
+    ):
+        """Persist inbound shared docs for shared_with_me / commons intake workflows."""
+        async with self.pool.acquire() as conn:
+            sender_name = await conn.fetchval(
+                "SELECT node_name FROM koi_net_nodes WHERE node_rid = $1",
+                source_node,
+            )
+
+            if event_type == "FORGET":
+                await conn.execute(
+                    """
+                    UPDATE koi_shared_documents SET status = 'retracted'
+                    WHERE document_rid = $1 AND sender_node = $2 AND status != 'retracted'
+                    """,
+                    rid,
+                    source_node,
+                )
+                logger.info(f"Retracted shared document {rid} from {source_node}")
+                return
+
+            if event_id:
+                exists = await conn.fetchval(
+                    "SELECT 1 FROM koi_shared_documents WHERE event_id = $1::UUID",
+                    event_id,
+                )
+                if exists:
+                    logger.debug(
+                        f"Shared document {rid} already persisted (event_id={event_id}), skipping"
+                    )
+                    return
+
+            effective_recipient_type = recipient_type if recipient_type in {"peer", "commons"} else "peer"
+            effective_intake_status = (
+                intake_status
+                if intake_status in {"staged", "approved", "rejected"}
+                else ("none" if effective_recipient_type == "peer" else "approved")
+            )
+            row_status = "staged" if effective_intake_status == "staged" else "received"
+
+            try:
+                await conn.execute(
+                    """
+                    INSERT INTO koi_shared_documents
+                        (event_id, document_rid, sender_node, sender_name, event_type,
+                         manifest, contents, message, received_at, status,
+                         recipient_type, intake_status)
+                    VALUES ($1::UUID, $2, $3, $4, $5, $6, $7, $8, NOW(), $9, $10, $11)
+                    """,
+                    event_id,
+                    rid,
+                    source_node,
+                    sender_name,
+                    event_type,
+                    json.dumps(manifest) if manifest is not None else None,
+                    json.dumps(contents),
+                    contents.get("message", ""),
+                    row_status,
+                    effective_recipient_type,
+                    effective_intake_status,
+                )
+            except Exception as exc:
+                if "recipient_type" not in str(exc) and "intake_status" not in str(exc):
+                    raise
+                await conn.execute(
+                    """
+                    INSERT INTO koi_shared_documents
+                        (event_id, document_rid, sender_node, sender_name, event_type,
+                         manifest, contents, message, received_at)
+                    VALUES ($1::UUID, $2, $3, $4, $5, $6, $7, $8, NOW())
+                    """,
+                    event_id,
+                    rid,
+                    source_node,
+                    sender_name,
+                    event_type,
+                    json.dumps(manifest) if manifest is not None else None,
+                    json.dumps(contents),
+                    contents.get("message", ""),
+                )
+            logger.info(
+                f"Persisted shared document {rid} from {source_node} "
+                f"({sender_name}), recipient_type={effective_recipient_type}, intake={effective_intake_status}"
+            )
 
     async def _confirm_events(
         self,

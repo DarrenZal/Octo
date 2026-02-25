@@ -13,6 +13,7 @@ Endpoints:
     POST /koi-net/bundles/fetch       — Serve bundles by RID
     POST /koi-net/rids/fetch          — List available RIDs
     GET  /koi-net/health              — Node identity and status
+    GET  /koi-net/edges              — Active federation edges (dashboard)
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import uuid as _uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -27,6 +29,7 @@ import asyncpg
 import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel as _ShareBaseModel
 
 from api.koi_protocol import (
     BundlesPayloadResponse,
@@ -323,6 +326,18 @@ async def _refresh_peer_public_key(source_node: str):
     ontology_uri = node.get("ontology_uri")
     ontology_version = node.get("ontology_version")
     async with _db_pool.acquire() as conn:
+        existing_key = await conn.fetchval(
+            "SELECT public_key FROM koi_net_nodes WHERE node_rid = $1",
+            source_node,
+        )
+        if existing_key and existing_key != public_key:
+            logger.warning(
+                "KEY MISMATCH during key refresh for %s — pinned key starts with: %s... "
+                "refreshed key starts with: %s... refusing update",
+                source_node, existing_key[:20], public_key[:20],
+            )
+            return None
+
         await conn.execute(
             """
             INSERT INTO koi_net_nodes
@@ -333,7 +348,6 @@ async def _refresh_peer_public_key(source_node: str):
                 node_name = EXCLUDED.node_name,
                 node_type = EXCLUDED.node_type,
                 base_url = EXCLUDED.base_url,
-                public_key = EXCLUDED.public_key,
                 ontology_uri = COALESCE(EXCLUDED.ontology_uri, koi_net_nodes.ontology_uri),
                 ontology_version = COALESCE(EXCLUDED.ontology_version, koi_net_nodes.ontology_version),
                 status = 'active',
@@ -446,6 +460,18 @@ async def _persist_bootstrap_peer(
     ontology_version = contents.get("ontology_version")
 
     async with _db_pool.acquire() as conn:
+        existing_key = await conn.fetchval(
+            "SELECT public_key FROM koi_net_nodes WHERE node_rid = $1",
+            source_node,
+        )
+        if existing_key and existing_key != public_key_b64:
+            logger.warning(
+                "KEY MISMATCH during bootstrap for %s — pinned key starts with: %s... "
+                "bootstrap key starts with: %s... refusing update",
+                source_node, existing_key[:20], public_key_b64[:20],
+            )
+            return
+
         await conn.execute(
             """
             INSERT INTO koi_net_nodes
@@ -457,7 +483,6 @@ async def _persist_bootstrap_peer(
                 node_name = EXCLUDED.node_name,
                 node_type = EXCLUDED.node_type,
                 base_url = EXCLUDED.base_url,
-                public_key = EXCLUDED.public_key,
                 ontology_uri = COALESCE(EXCLUDED.ontology_uri, koi_net_nodes.ontology_uri),
                 ontology_version = COALESCE(EXCLUDED.ontology_version, koi_net_nodes.ontology_version),
                 status = 'active',
@@ -559,6 +584,34 @@ def _wrap_response(payload: Dict[str, Any], target_node: Optional[str], signed: 
     return payload
 
 
+def _read_admin_token() -> Optional[str]:
+    """Read admin token from env or state dir file."""
+    admin_token = os.getenv("KOI_ADMIN_TOKEN")
+    if admin_token:
+        return admin_token
+
+    state_dir = os.getenv("KOI_STATE_DIR", "")
+    token_path = os.path.join(state_dir, "admin_token") if state_dir else ""
+    if token_path and os.path.exists(token_path):
+        with open(token_path) as f:
+            return f.read().strip()
+    return None
+
+
+def _enforce_local_admin(request: Request) -> Optional[JSONResponse]:
+    """Return protocol error response if request is not localhost/admin, else None."""
+    client_host = request.client.host if request.client else None
+    if client_host not in ("127.0.0.1", "::1", "localhost"):
+        return _protocol_error(403, "FORBIDDEN", "Endpoint is localhost-only")
+
+    admin_token = _read_admin_token()
+    if admin_token:
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer ") or auth_header[7:] != admin_token:
+            return _protocol_error(401, "UNAUTHORIZED", "Invalid or missing admin token")
+    return None
+
+
 # =============================================================================
 # Endpoints
 # =============================================================================
@@ -583,6 +636,25 @@ async def handshake(request: Request):
 
     # Store/update peer in koi_net_nodes
     async with _db_pool.acquire() as conn:
+        # Key pinning check: reject if peer presents a different key than what's pinned
+        if peer.public_key:
+            existing_key = await conn.fetchval(
+                "SELECT public_key FROM koi_net_nodes WHERE node_rid = $1",
+                peer.node_rid,
+            )
+            if existing_key and existing_key != peer.public_key:
+                logger.warning(
+                    "KEY ROTATION REJECTED: node %s (%s) presented different public key. "
+                    "Existing key starts with: %s... New key starts with: %s... "
+                    "Manual re-approval required.",
+                    peer.node_rid, peer.node_name, existing_key[:20], peer.public_key[:20],
+                )
+                return _protocol_error(
+                    403,
+                    "KEY_MISMATCH",
+                    f"Public key for {peer.node_rid} does not match pinned key. Manual re-approval required.",
+                )
+
         await conn.execute(
             """
             INSERT INTO koi_net_nodes
@@ -594,7 +666,6 @@ async def handshake(request: Request):
                 node_name = EXCLUDED.node_name,
                 node_type = EXCLUDED.node_type,
                 base_url = EXCLUDED.base_url,
-                public_key = EXCLUDED.public_key,
                 provides_event = EXCLUDED.provides_event,
                 provides_state = EXCLUDED.provides_state,
                 ontology_uri = COALESCE(EXCLUDED.ontology_uri, koi_net_nodes.ontology_uri),
@@ -607,13 +678,64 @@ async def handshake(request: Request):
             peer.node_type,
             peer.base_url,
             peer.public_key,
-            peer.provides.event,
-            peer.provides.state,
+            peer.provides.event if peer.provides else [],
+            peer.provides.state if peer.provides else [],
             peer.ontology_uri,
             peer.ontology_version,
         )
 
-    logger.info(f"Handshake with {peer.node_rid} ({peer.node_name})")
+        # Inbound edge: we can poll them immediately.
+        edge_rid_inbound = f"orn:koi-net.edge:{peer.node_rid}>{_node_profile.node_rid}:poll"
+        await conn.execute(
+            """
+            INSERT INTO koi_net_edges
+                (edge_rid, source_node, target_node, edge_type, status, rid_types)
+            VALUES ($1, $2, $3, 'POLL', 'APPROVED', $4)
+            ON CONFLICT (edge_rid) DO UPDATE SET updated_at = NOW()
+            """,
+            edge_rid_inbound,
+            peer.node_rid,
+            _node_profile.node_rid,
+            peer.provides.event if peer.provides else [],
+        )
+
+        # Outbound edge: peer polling us requires explicit local approval.
+        edge_rid_outbound = f"orn:koi-net.edge:{_node_profile.node_rid}>{peer.node_rid}:poll"
+        await conn.execute(
+            """
+            INSERT INTO koi_net_edges
+                (edge_rid, source_node, target_node, edge_type, status, rid_types)
+            VALUES ($1, $2, $3, 'POLL', 'PROPOSED', $4)
+            ON CONFLICT (edge_rid) DO NOTHING
+            """,
+            edge_rid_outbound,
+            _node_profile.node_rid,
+            peer.node_rid,
+            _node_profile.provides.event if _node_profile.provides else [],
+        )
+
+        if peer.node_name:
+            try:
+                await conn.execute(
+                    """
+                    INSERT INTO koi_net_peer_aliases (alias, node_rid)
+                    VALUES ($1, $2)
+                    ON CONFLICT (alias) DO UPDATE SET node_rid = $2
+                    """,
+                    peer.node_name.lower(),
+                    peer.node_rid,
+                )
+            except asyncpg.PostgresError as exc:
+                if isinstance(exc, asyncpg.exceptions.UndefinedTableError):
+                    logger.warning("koi_net_peer_aliases table missing; skipping alias auto-create")
+                else:
+                    raise
+
+    logger.info(
+        "Handshake with %s (%s) — inbound edge APPROVED, outbound edge PROPOSED",
+        peer.node_rid,
+        peer.node_name,
+    )
 
     response = HandshakeResponse(
         profile=_node_profile,
@@ -892,6 +1014,55 @@ async def rids_fetch(request: Request):
     )
 
 
+@koi_net_router.get("/edges")
+async def koi_net_edges():
+    """Active federation edges (for dashboard visualization)."""
+    if not _db_pool:
+        return {"edges": []}
+    async with _db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT edge_rid, source_node, target_node, edge_type, status "
+            "FROM koi_net_edges WHERE status = 'APPROVED'"
+        )
+    return {"edges": [dict(r) for r in rows]}
+
+
+@koi_net_router.post("/edges/approve")
+async def approve_edge(request: Request):
+    """Approve a PROPOSED edge to allow a peer to poll our events."""
+    auth_err = _enforce_local_admin(request)
+    if auth_err:
+        return auth_err
+
+    try:
+        body = await request.json()
+    except Exception:
+        return _protocol_error(400, "INVALID_JSON", "Invalid JSON body")
+
+    edge_rid = body.get("edge_rid")
+    if not edge_rid:
+        return _protocol_error(400, "MISSING_EDGE_RID", "edge_rid is required")
+
+    if not _db_pool:
+        return _protocol_error(503, "NOT_INITIALIZED", "KOI-net not initialized")
+
+    async with _db_pool.acquire() as conn:
+        result = await conn.execute(
+            """
+            UPDATE koi_net_edges SET status = 'APPROVED', updated_at = NOW()
+            WHERE edge_rid = $1 AND status = 'PROPOSED'
+            """,
+            edge_rid,
+        )
+        count = int(result.split()[-1])
+
+    if count == 0:
+        return _protocol_error(404, "EDGE_NOT_FOUND", f"No PROPOSED edge found with rid '{edge_rid}'")
+
+    logger.info("Approved edge: %s", edge_rid)
+    return {"status": "approved", "edge_rid": edge_rid}
+
+
 @koi_net_router.get("/health")
 async def koi_net_health():
     """Node identity, connected peers, capabilities."""
@@ -938,7 +1109,575 @@ async def koi_net_health():
                 "/koi-net/handshake",
                 "/koi-net/events/confirm",
                 "/koi-net/health",
+                "/koi-net/share",
+                "/koi-net/shared-with-me",
+                "/koi-net/commons/intake",
+                "/koi-net/commons/intake/decide",
             ],
         },
         "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
+
+
+class ShareDocumentRequest(_ShareBaseModel):
+    """Request to share a document with a peer or commons node."""
+    document_rid: str
+    recipient: str
+    recipient_type: str = "peer"  # peer | commons
+    message: Optional[str] = None
+    share_mode: str = "root_plus_required"  # root_only | root_plus_required | context_pack
+    context_depth: Optional[int] = None
+    references: Optional[List[Dict[str, Any]]] = None
+    contents: Optional[Dict[str, Any]] = None
+
+
+class ShareDocumentResponse(_ShareBaseModel):
+    status: str
+    event_id: str
+    document_rid: str
+    recipient_node_rid: str
+    recipient_type: str = "peer"
+    share_mode: str
+    context_depth: int = 1
+    references_total: int = 0
+    references_included: int = 0
+    references_missing: int = 0
+    references_excluded: int = 0
+    message: Optional[str] = None
+
+
+class CommonsIntakeDecisionRequest(_ShareBaseModel):
+    share_id: Optional[int] = None
+    event_id: Optional[str] = None
+    action: str  # approve | reject
+    reviewer: Optional[str] = None
+    note: Optional[str] = None
+
+
+@koi_net_router.post("/share")
+async def share_document(req: ShareDocumentRequest):
+    """Share a document by queueing a recipient-scoped FUN event."""
+    allowed_modes = {"root_only", "root_plus_required", "context_pack"}
+    allowed_recipient_types = {"peer", "commons"}
+    share_mode = (req.share_mode or "root_plus_required").strip().lower()
+    recipient_type = (req.recipient_type or "peer").strip().lower()
+    if share_mode not in allowed_modes:
+        return _protocol_error(
+            400,
+            "INVALID_SHARE_MODE",
+            f"Invalid share_mode '{req.share_mode}'. Valid modes: root_only, root_plus_required, context_pack",
+        )
+    if recipient_type not in allowed_recipient_types:
+        return _protocol_error(
+            400,
+            "INVALID_RECIPIENT_TYPE",
+            f"Invalid recipient_type '{req.recipient_type}'. Valid types: peer, commons",
+        )
+    default_context_depth = 2 if share_mode == "context_pack" else 1
+    context_depth = req.context_depth if req.context_depth is not None else default_context_depth
+    if context_depth < 1 or context_depth > 4:
+        return _protocol_error(400, "INVALID_CONTEXT_DEPTH", "context_depth must be an integer between 1 and 4")
+
+    if not _db_pool:
+        return _protocol_error(503, "NOT_INITIALIZED", "KOI-net not initialized")
+    if not _event_queue:
+        return _protocol_error(503, "NOT_INITIALIZED", "Event queue not initialized")
+    if not _node_profile:
+        return _protocol_error(503, "NOT_INITIALIZED", "Node identity not initialized")
+
+    async with _db_pool.acquire() as conn:
+        recipient_node_rid = await _resolve_recipient(conn, req.recipient)
+        if not recipient_node_rid:
+            return _protocol_error(
+                404,
+                "RECIPIENT_NOT_FOUND",
+                f"No peer found for '{req.recipient}'. Register peer via /koi-net/handshake first.",
+            )
+
+        prev = await conn.fetchrow(
+            """
+            SELECT id FROM koi_net_events
+            WHERE rid = $1 AND source_node = $2 AND target_node = $3
+            ORDER BY queued_at DESC LIMIT 1
+            """,
+            req.document_rid,
+            _node_profile.node_rid,
+            recipient_node_rid,
+        )
+        event_type = EventType.UPDATE if prev else EventType.NEW
+
+        now_z = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        contents_payload = req.contents or {"message": req.message or "", "document_rid": req.document_rid}
+        if req.message and not contents_payload.get("message"):
+            contents_payload["message"] = req.message
+
+        references_payload: List[Dict[str, Any]] = []
+        if req.references:
+            references_payload = [r for r in req.references if isinstance(r, dict)]
+        elif isinstance(contents_payload.get("references"), list):
+            references_payload = [r for r in contents_payload.get("references", []) if isinstance(r, dict)]
+
+        refs_total = len(references_payload)
+        refs_included = 0
+        refs_required = 0
+        refs_missing = 0
+        refs_excluded = 0
+        for ref in references_payload:
+            if bool(ref.get("required")):
+                refs_required += 1
+            if bool(ref.get("included")) or bool(ref.get("include")):
+                refs_included += 1
+            if not bool(ref.get("exists")):
+                refs_missing += 1
+            elif not (bool(ref.get("included")) or bool(ref.get("include"))):
+                refs_excluded += 1
+
+        dependency_graph = contents_payload.get("dependency_graph")
+        dependency_graph_summary: Optional[Dict[str, Any]] = None
+        missing_references: List[Dict[str, Any]] = []
+        if isinstance(dependency_graph, dict):
+            maybe_summary = dependency_graph.get("summary")
+            if isinstance(maybe_summary, dict):
+                dependency_graph_summary = maybe_summary
+            maybe_missing = dependency_graph.get("missing_references")
+            if isinstance(maybe_missing, list):
+                missing_references = [m for m in maybe_missing if isinstance(m, dict)]
+
+        if dependency_graph_summary:
+            try:
+                refs_missing = int(dependency_graph_summary.get("unresolved_references", refs_missing))
+            except Exception:
+                pass
+            try:
+                refs_excluded = int(
+                    dependency_graph_summary.get("missing_references", refs_missing + refs_excluded)
+                ) - refs_missing
+                refs_excluded = max(refs_excluded, 0)
+            except Exception:
+                pass
+
+        contents_payload["_koi_share"] = True
+        contents_payload["_koi_share_meta"] = {
+            "recipient_type": recipient_type,
+            "share_mode": share_mode,
+            "context_depth": context_depth,
+            "references_total": refs_total,
+            "references_included": refs_included,
+            "references_missing": refs_missing,
+            "references_excluded": refs_excluded,
+        }
+        content_hash = _canonical_sha256_json(contents_payload)
+
+        manifest_data = {
+            "rid": req.document_rid,
+            "timestamp": now_z,
+            "sha256_hash": content_hash,
+            "kind": "document_share",
+            "recipient_type": recipient_type,
+            "share_mode": share_mode,
+            "context_depth": context_depth,
+            "references_summary": {
+                "total": refs_total,
+                "required": refs_required,
+                "included": refs_included,
+                "missing_unresolved": refs_missing,
+                "excluded_not_included": refs_excluded,
+                "optional": max(refs_total - refs_required, 0),
+            },
+        }
+        if references_payload:
+            manifest_data["references"] = references_payload
+        if dependency_graph_summary:
+            manifest_data["dependency_graph_summary"] = dependency_graph_summary
+        if missing_references:
+            manifest_data["missing_references"] = missing_references[:200]
+        if recipient_type == "commons":
+            manifest_data["intake_policy"] = {
+                "mode": "staged",
+                "requires_manual_approval": True,
+            }
+
+        event_id = str(_uuid.uuid4())
+        await _event_queue.add(
+            event_type=event_type.value,
+            rid=req.document_rid,
+            manifest=manifest_data,
+            contents=contents_payload,
+            ttl_hours=168,
+            event_id=event_id,
+            target_node=recipient_node_rid,
+        )
+
+        try:
+            await conn.execute(
+                """
+                INSERT INTO koi_outbound_shares (document_rid, target_node)
+                VALUES ($1, $2)
+                ON CONFLICT (document_rid, target_node)
+                DO UPDATE SET shared_at = NOW(), retracted_at = NULL
+                """,
+                req.document_rid,
+                recipient_node_rid,
+            )
+        except Exception as ledger_err:
+            logger.warning("Could not record outbound share in ledger: %s", ledger_err)
+
+    return ShareDocumentResponse(
+        status="queued",
+        event_id=event_id,
+        document_rid=req.document_rid,
+        recipient_node_rid=recipient_node_rid,
+        recipient_type=recipient_type,
+        share_mode=share_mode,
+        context_depth=context_depth,
+        references_total=refs_total,
+        references_included=refs_included,
+        references_missing=refs_missing,
+        references_excluded=refs_excluded,
+        message=f"Document queued for delivery to {req.recipient} ({event_type.value})",
+    )
+
+
+@koi_net_router.get("/shared-with-me")
+async def shared_with_me(
+    since: Optional[str] = None,
+    from_peer: Optional[str] = None,
+    limit: int = 50,
+):
+    """List documents shared with this node by peers."""
+    if not _db_pool:
+        return _protocol_error(503, "NOT_INITIALIZED", "KOI-net not initialized")
+    if not _node_profile:
+        return _protocol_error(503, "NOT_INITIALIZED", "Node identity not initialized")
+
+    async with _db_pool.acquire() as conn:
+        conditions = ["status != 'retracted'"]
+        params: list = []
+        idx = 1
+
+        if since:
+            conditions.append(f"received_at >= ${idx}::timestamptz")
+            params.append(since)
+            idx += 1
+
+        if from_peer:
+            resolved = await _resolve_recipient(conn, from_peer)
+            if not resolved:
+                return {"documents": [], "count": 0, "error": f"Unknown peer: {from_peer}"}
+            conditions.append(f"sender_node = ${idx}")
+            params.append(resolved)
+            idx += 1
+
+        where = " AND ".join(conditions)
+        try:
+            rows = await conn.fetch(
+                f"""SELECT event_id, event_type, document_rid, sender_node, sender_name,
+                           manifest, contents, message, received_at, status,
+                           recipient_type, intake_status, reviewed_at, reviewed_by, review_notes
+                    FROM koi_shared_documents
+                    WHERE {where}
+                    ORDER BY received_at DESC
+                    LIMIT ${idx}""",
+                *params, limit,
+            )
+        except asyncpg.PostgresError as exc:
+            if isinstance(exc, asyncpg.exceptions.UndefinedTableError):
+                return _protocol_error(
+                    503,
+                    "SHARED_DOCUMENTS_SCHEMA_MISSING",
+                    "Shared documents table is missing. Apply migration 050_shared_documents.sql",
+                )
+            if "recipient_type" not in str(exc) and "intake_status" not in str(exc):
+                raise
+            rows = await conn.fetch(
+                f"""SELECT event_id, event_type, document_rid, sender_node, sender_name,
+                           manifest, contents, message, received_at, status
+                    FROM koi_shared_documents
+                    WHERE {where}
+                    ORDER BY received_at DESC
+                    LIMIT ${idx}""",
+                *params, limit,
+            )
+
+        items = []
+        for r in rows:
+            contents = json.loads(r["contents"]) if isinstance(r["contents"], str) else r["contents"]
+            manifest = json.loads(r["manifest"]) if isinstance(r["manifest"], str) else r["manifest"]
+            share_meta = contents.get("_koi_share_meta", {}) if isinstance(contents, dict) else {}
+            share_mode = (
+                share_meta.get("share_mode") if isinstance(share_meta, dict) else None
+            ) or ((manifest or {}).get("share_mode") if isinstance(manifest, dict) else None)
+            context_depth = (
+                share_meta.get("context_depth") if isinstance(share_meta, dict) else None
+            ) or ((manifest or {}).get("context_depth") if isinstance(manifest, dict) else None)
+            recipient_type = (
+                share_meta.get("recipient_type") if isinstance(share_meta, dict) else None
+            ) or ((manifest or {}).get("recipient_type") if isinstance(manifest, dict) else None)
+            if not recipient_type:
+                recipient_type = r.get("recipient_type") or "peer"
+            references_summary = (manifest or {}).get("references_summary") if isinstance(manifest, dict) else None
+            dependency_graph_summary = (
+                (manifest or {}).get("dependency_graph_summary") if isinstance(manifest, dict) else None
+            )
+            missing_references = (manifest or {}).get("missing_references") if isinstance(manifest, dict) else None
+            if not missing_references and isinstance(manifest, dict):
+                dep_graph = manifest.get("dependency_graph")
+                if isinstance(dep_graph, dict):
+                    maybe_missing = dep_graph.get("missing_references")
+                    if isinstance(maybe_missing, list):
+                        missing_references = maybe_missing
+
+            items.append(
+                {
+                    "event_id": str(r["event_id"]) if r["event_id"] else None,
+                    "event_type": r["event_type"],
+                    "document_rid": r["document_rid"],
+                    "sender": r["sender_name"] or r["sender_node"],
+                    "sender_node_rid": r["sender_node"],
+                    "manifest": manifest,
+                    "recipient_type": recipient_type,
+                    "share_mode": share_mode,
+                    "context_depth": context_depth,
+                    "references_summary": references_summary,
+                    "dependency_graph_summary": dependency_graph_summary,
+                    "missing_references_count": len(missing_references) if isinstance(missing_references, list) else 0,
+                    "missing_references": missing_references[:50] if isinstance(missing_references, list) else [],
+                    "has_contents": contents is not None,
+                    "message": r["message"],
+                    "received_at": r["received_at"].isoformat() if r["received_at"] else None,
+                    "status": r["status"],
+                    "intake_status": r.get("intake_status"),
+                    "reviewed_at": r["reviewed_at"].isoformat() if r.get("reviewed_at") else None,
+                    "reviewed_by": r.get("reviewed_by"),
+                    "review_notes": r.get("review_notes"),
+                }
+            )
+
+    return {"documents": items, "count": len(items)}
+
+
+@koi_net_router.get("/commons/intake")
+async def commons_intake(
+    status: str = "staged",
+    from_peer: Optional[str] = None,
+    limit: int = 50,
+):
+    """List incoming commons shares and their intake status."""
+    if not _db_pool:
+        return _protocol_error(503, "NOT_INITIALIZED", "KOI-net not initialized")
+
+    normalized_status = (status or "staged").strip().lower()
+    allowed_status = {"staged", "approved", "rejected", "all"}
+    if normalized_status not in allowed_status:
+        return _protocol_error(
+            400,
+            "INVALID_INTAKE_STATUS",
+            f"Invalid status '{status}'. Valid statuses: staged, approved, rejected, all",
+        )
+
+    async with _db_pool.acquire() as conn:
+        conditions = ["recipient_type = 'commons'", "status != 'retracted'"]
+        params: list = []
+        idx = 1
+
+        if normalized_status != "all":
+            conditions.append(f"intake_status = ${idx}")
+            params.append(normalized_status)
+            idx += 1
+
+        if from_peer:
+            resolved = await _resolve_recipient(conn, from_peer)
+            if not resolved:
+                return {"documents": [], "count": 0, "error": f"Unknown peer: {from_peer}"}
+            conditions.append(f"sender_node = ${idx}")
+            params.append(resolved)
+            idx += 1
+
+        where = " AND ".join(conditions)
+        try:
+            rows = await conn.fetch(
+                f"""SELECT id, event_id, event_type, document_rid, sender_node, sender_name,
+                           manifest, contents, message, received_at, status,
+                           intake_status, reviewed_at, reviewed_by, review_notes
+                    FROM koi_shared_documents
+                    WHERE {where}
+                    ORDER BY received_at DESC
+                    LIMIT ${idx}""",
+                *params, limit,
+            )
+        except asyncpg.PostgresError as exc:
+            if isinstance(
+                exc,
+                (asyncpg.exceptions.UndefinedColumnError, asyncpg.exceptions.UndefinedTableError),
+            ):
+                return _protocol_error(
+                    503,
+                    "COMMONS_INTAKE_SCHEMA_MISSING",
+                    "Commons intake fields are missing. Apply migration 051_shared_documents_intake.sql",
+                )
+            raise
+
+    docs = []
+    for r in rows:
+        manifest = json.loads(r["manifest"]) if isinstance(r["manifest"], str) else r["manifest"]
+        contents = json.loads(r["contents"]) if isinstance(r["contents"], str) else r["contents"]
+        docs.append(
+            {
+                "id": r["id"],
+                "event_id": str(r["event_id"]) if r["event_id"] else None,
+                "event_type": r["event_type"],
+                "document_rid": r["document_rid"],
+                "sender": r["sender_name"] or r["sender_node"],
+                "sender_node_rid": r["sender_node"],
+                "message": r["message"],
+                "recipient_type": "commons",
+                "status": r["status"],
+                "intake_status": r["intake_status"],
+                "received_at": r["received_at"].isoformat() if r["received_at"] else None,
+                "reviewed_at": r["reviewed_at"].isoformat() if r["reviewed_at"] else None,
+                "reviewed_by": r["reviewed_by"],
+                "review_notes": r["review_notes"],
+                "manifest": manifest,
+                "has_contents": contents is not None,
+            }
+        )
+
+    return {"documents": docs, "count": len(docs), "status_filter": normalized_status}
+
+
+@koi_net_router.post("/commons/intake/decide")
+async def commons_intake_decide(request: Request):
+    """Approve/reject a staged commons share entry (localhost admin only)."""
+    auth_err = _enforce_local_admin(request)
+    if auth_err:
+        return auth_err
+
+    if not _db_pool:
+        return _protocol_error(503, "NOT_INITIALIZED", "KOI-net not initialized")
+
+    try:
+        raw = await request.json()
+    except Exception:
+        return _protocol_error(400, "INVALID_JSON", "Invalid JSON body")
+
+    try:
+        req = CommonsIntakeDecisionRequest(**raw)
+    except Exception as exc:
+        return _protocol_error(400, "INVALID_REQUEST", f"Invalid request: {exc}")
+
+    if not req.share_id and not req.event_id:
+        return _protocol_error(400, "MISSING_IDENTIFIER", "Provide either share_id or event_id")
+
+    parsed_event_id: Optional[str] = None
+    if req.event_id:
+        try:
+            parsed_event_id = str(_uuid.UUID(req.event_id))
+        except Exception:
+            return _protocol_error(400, "INVALID_EVENT_ID", "event_id must be a valid UUID")
+
+    action = (req.action or "").strip().lower()
+    if action not in {"approve", "reject"}:
+        return _protocol_error(400, "INVALID_ACTION", "action must be 'approve' or 'reject'")
+
+    next_intake_status = "approved" if action == "approve" else "rejected"
+    next_status = "ingested" if action == "approve" else "received"
+
+    async with _db_pool.acquire() as conn:
+        try:
+            if req.share_id:
+                row = await conn.fetchrow(
+                    """
+                    UPDATE koi_shared_documents
+                    SET intake_status = $2,
+                        status = $3,
+                        reviewed_at = NOW(),
+                        reviewed_by = COALESCE($4, reviewed_by),
+                        review_notes = $5
+                    WHERE id = $1
+                      AND recipient_type = 'commons'
+                      AND status != 'retracted'
+                    RETURNING id, event_id, document_rid, sender_node, intake_status, status
+                    """,
+                    req.share_id,
+                    next_intake_status,
+                    next_status,
+                    req.reviewer,
+                    req.note,
+                )
+            else:
+                row = await conn.fetchrow(
+                    """
+                    UPDATE koi_shared_documents
+                    SET intake_status = $2,
+                        status = $3,
+                        reviewed_at = NOW(),
+                        reviewed_by = COALESCE($4, reviewed_by),
+                        review_notes = $5
+                    WHERE event_id = $1::UUID
+                      AND recipient_type = 'commons'
+                      AND status != 'retracted'
+                    RETURNING id, event_id, document_rid, sender_node, intake_status, status
+                    """,
+                    parsed_event_id,
+                    next_intake_status,
+                    next_status,
+                    req.reviewer,
+                    req.note,
+                )
+        except asyncpg.PostgresError as exc:
+            if isinstance(
+                exc,
+                (asyncpg.exceptions.UndefinedColumnError, asyncpg.exceptions.UndefinedTableError),
+            ):
+                return _protocol_error(
+                    503,
+                    "COMMONS_INTAKE_SCHEMA_MISSING",
+                    "Commons intake fields are missing. Apply migration 051_shared_documents_intake.sql",
+                )
+            raise
+
+    if not row:
+        return _protocol_error(404, "INTAKE_NOT_FOUND", "No matching commons intake entry found")
+
+    return {
+        "status": "ok",
+        "action": action,
+        "id": row["id"],
+        "event_id": str(row["event_id"]) if row["event_id"] else None,
+        "document_rid": row["document_rid"],
+        "sender_node": row["sender_node"],
+        "intake_status": row["intake_status"],
+        "record_status": row["status"],
+    }
+
+
+async def _resolve_recipient(conn: asyncpg.Connection, recipient: str) -> Optional[str]:
+    """Resolve alias/node name/full node_rid to node_rid."""
+    alias_rid = None
+    try:
+        alias_rid = await conn.fetchval(
+            "SELECT node_rid FROM koi_net_peer_aliases WHERE LOWER(alias) = LOWER($1)",
+            recipient,
+        )
+    except asyncpg.PostgresError as exc:
+        if not isinstance(exc, asyncpg.exceptions.UndefinedTableError):
+            raise
+    if alias_rid:
+        return alias_rid
+
+    node_rid = await conn.fetchval(
+        "SELECT node_rid FROM koi_net_nodes WHERE LOWER(node_name) = LOWER($1) AND status = 'active'",
+        recipient,
+    )
+    if node_rid:
+        return node_rid
+
+    if recipient.startswith("orn:koi-net.node:"):
+        exists = await conn.fetchval(
+            "SELECT 1 FROM koi_net_nodes WHERE node_rid = $1",
+            recipient,
+        )
+        if exists:
+            return recipient
+
+    return None

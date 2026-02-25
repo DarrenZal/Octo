@@ -39,6 +39,7 @@ class EventQueue:
         source_node: Optional[str] = None,
         ttl_hours: int = DEFAULT_TTL_HOURS,
         event_id: Optional[str] = None,
+        target_node: Optional[str] = None,
     ) -> Optional[str]:
         """Add an event to the queue. Returns the event_id.
 
@@ -53,9 +54,9 @@ class EventQueue:
                 row = await conn.fetchrow(
                     """
                     INSERT INTO koi_net_events
-                        (event_id, event_type, rid, manifest, contents, source_node, expires_at)
+                        (event_id, event_type, rid, manifest, contents, source_node, target_node, expires_at)
                     VALUES
-                        ($1::UUID, $2, $3, $4, $5, $6, NOW() + ($7 || ' hours')::INTERVAL)
+                        ($1::UUID, $2, $3, $4, $5, $6, $7, NOW() + ($8 || ' hours')::INTERVAL)
                     ON CONFLICT (source_node, event_id) WHERE event_id IS NOT NULL DO NOTHING
                     RETURNING event_id::TEXT
                     """,
@@ -65,21 +66,22 @@ class EventQueue:
                     json.dumps(manifest) if manifest else None,
                     json.dumps(contents) if contents else None,
                     effective_source,
+                    target_node,
                     str(ttl_hours),
                 )
                 if row is None:
                     logger.debug(f"Duplicate event {event_id} from {effective_source}, skipped")
                     return None
-                logger.info(f"Queued {event_type} event for {rid} (id={event_id})")
+                logger.info(f"Queued {event_type} event for {rid} (id={event_id}, target={target_node})")
                 return event_id
             else:
                 # Locally generated event — DB assigns event_id
                 row = await conn.fetchrow(
                     """
                     INSERT INTO koi_net_events
-                        (event_type, rid, manifest, contents, source_node, expires_at)
+                        (event_type, rid, manifest, contents, source_node, target_node, expires_at)
                     VALUES
-                        ($1, $2, $3, $4, $5, NOW() + ($6 || ' hours')::INTERVAL)
+                        ($1, $2, $3, $4, $5, $6, NOW() + ($7 || ' hours')::INTERVAL)
                     RETURNING event_id::TEXT
                     """,
                     event_type,
@@ -87,10 +89,11 @@ class EventQueue:
                     json.dumps(manifest) if manifest else None,
                     json.dumps(contents) if contents else None,
                     effective_source,
+                    target_node,
                     str(ttl_hours),
                 )
                 new_id = row["event_id"]
-                logger.info(f"Queued {event_type} event for {rid} (id={new_id})")
+                logger.info(f"Queued {event_type} event for {rid} (id={new_id}, target={target_node})")
                 return new_id
 
     async def poll(
@@ -105,13 +108,15 @@ class EventQueue:
         Marks events as delivered_to this node.
         """
         async with self.pool.acquire() as conn:
-            # Fetch events not yet delivered to this node and not expired
+            # Fetch events not yet delivered to this node and not expired.
+            # target_node scoping: NULL = broadcast (visible to all), non-NULL = unicast.
             rows = await conn.fetch(
                 """
                 SELECT id, event_id::TEXT, event_type, rid, manifest, contents, source_node, queued_at
                 FROM koi_net_events
                 WHERE NOT ($1 = ANY(delivered_to))
                   AND expires_at > NOW()
+                  AND (target_node IS NULL OR target_node = $1)
                 ORDER BY queued_at ASC
                 LIMIT $2
                 """,
@@ -181,6 +186,7 @@ class EventQueue:
                 FROM koi_net_events
                 WHERE NOT ($1 = ANY(delivered_to))
                   AND expires_at > NOW()
+                  AND (target_node IS NULL OR target_node = $1)
                 ORDER BY queued_at ASC
                 LIMIT $2
                 """,
