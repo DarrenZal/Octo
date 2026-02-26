@@ -208,19 +208,18 @@ for e in m['migrations']:
     # Wait for startup
     sleep 3
 
-    # Health check
-    local health_url
-    if [ "$name" = "gv" ]; then
-        health_url="http://127.0.0.1:8351/health"
-    elif [ "$name" = "fr" ]; then
-        health_url="http://127.0.0.1:8355/health"
+    # Health check — prefer /koi-net/health (fast, no heavy DB introspection),
+    # fall back to /health. Use --max-time 10 to avoid hanging on slow endpoints.
+    local port
+    if [ "$name" = "fr" ]; then
+        port=8355
     else
-        health_url="http://127.0.0.1:8351/health"
+        port=8351
     fi
 
     echo "Checking health..."
     local health
-    health=$(ssh "$host" "curl -sf $health_url" 2>/dev/null) || {
+    health=$(ssh "$host" "curl -sf --max-time 10 http://127.0.0.1:$port/koi-net/health 2>/dev/null || curl -sf --max-time 10 http://127.0.0.1:$port/health 2>/dev/null") || {
         echo "HEALTH CHECK FAILED for $name!"
         echo "Rolling back..."
         ssh "$host" "mv $path ${path}.failed && mv ${path}.bak $path && systemctl restart $service"
