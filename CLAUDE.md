@@ -167,6 +167,39 @@ ssh root@45.132.245.30 "/root/octo-quartz/rebuild.sh"
 2. Issue/install cert for new host via ACME and update nginx cert paths/server_name in `/etc/nginx/sites-available/octo-quartz`
 3. Rebuild and reload: `/root/octo-quartz/rebuild.sh && systemctl reload nginx`
 
+## Vendor Sync & Deployment
+
+Octo's KOI runtime code comes from the canonical repo (`RegenAI/koi-processor`) via pinned-SHA vendor sync.
+
+### How it works
+- `vendor/pin.txt` — SHA of the canonical commit to deploy
+- `vendor/sync.sh` — Fetches and vendors the canonical code at the pinned SHA
+- `deploy.sh` — Full deployment pipeline: vendor sync → rsync to servers → manifest-driven migrations → restart → health check
+
+### Deploy
+```bash
+# Deploy to all nodes (FR → GV → Octo)
+./deploy.sh --target all
+
+# Deploy to a single node
+./deploy.sh --target fr
+
+# Dry run (preview what would happen)
+./deploy.sh --target octo --dry-run
+
+# Skip vendor sync (use existing vendored code)
+./deploy.sh --target gv --skip-sync
+```
+
+### Migration governance
+Migrations are **manifest-driven** — only migrations listed in `migrations/baselines/${db}.json` are applied to each node. Each entry has a canonical `migration_id` (e.g. `bkc:039_koi_net_events`) and expected `sha256` checksum. Missing files or checksum mismatches halt the deploy with rollback.
+
+### Bump the pin
+1. Verify the canonical commit passes contract tests
+2. Update `vendor/pin.txt` with the new SHA
+3. Run `./deploy.sh --target fr` (lowest risk first)
+4. Verify health, then `--target gv`, then `--target octo`
+
 ## Common Operations
 
 ### SSH to server
