@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # KOI Runtime Deployment Script
-# Usage: ./deploy.sh [--target fr|gv|octo|all] [--dry-run] [--skip-sync] [--allow-missing-migrations]
+# Usage: ./deploy.sh [--target fr|gv|cv|octo|all] [--dry-run] [--skip-sync] [--allow-missing-migrations]
 
 TARGET="all"
 DRY_RUN=false
@@ -37,6 +37,11 @@ GV_HOST="root@37.27.48.12"
 GV_PATH="/home/koi/koi-processor"
 GV_SERVICE="gv-koi-api"
 GV_DB="gv_koi"
+
+CV_HOST="root@202.61.242.194"
+CV_PATH="/root/Octo/koi-processor"
+CV_SERVICE="cv-koi-api"
+CV_DB="cv_koi"
 
 # Step 1: Vendor sync
 if [ "$SKIP_SYNC" = false ]; then
@@ -234,17 +239,19 @@ for e in m['migrations']:
     echo "$name deployed successfully"
 }
 
-# Step 2: Deploy to target(s) — order: FR first (lowest risk), then GV, then Octo
+# Step 2: Deploy to target(s) — order: FR first (lowest risk), then GV, CV, then Octo
 case $TARGET in
     fr)   deploy_node "fr" "$FR_HOST" "$FR_PATH" "$FR_SERVICE" "$FR_DB" ;;
     gv)   deploy_node "gv" "$GV_HOST" "$GV_PATH" "$GV_SERVICE" "$GV_DB" ;;
+    cv)   deploy_node "cv" "$CV_HOST" "$CV_PATH" "$CV_SERVICE" "$CV_DB" ;;
     octo) deploy_node "octo" "$OCTO_HOST" "$OCTO_PATH" "$OCTO_SERVICE" "$OCTO_DB" ;;
     all)
         deploy_node "fr" "$FR_HOST" "$FR_PATH" "$FR_SERVICE" "$FR_DB" || exit 1
         deploy_node "gv" "$GV_HOST" "$GV_PATH" "$GV_SERVICE" "$GV_DB" || exit 1
+        deploy_node "cv" "$CV_HOST" "$CV_PATH" "$CV_SERVICE" "$CV_DB" || exit 1
         deploy_node "octo" "$OCTO_HOST" "$OCTO_PATH" "$OCTO_SERVICE" "$OCTO_DB" || exit 1
         ;;
-    *) echo "Unknown target: $TARGET (use fr|gv|octo|all)"; exit 1 ;;
+    *) echo "Unknown target: $TARGET (use fr|gv|cv|octo|all)"; exit 1 ;;
 esac
 
 echo ""

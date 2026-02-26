@@ -34,11 +34,12 @@ Legacy `legacy16` RIDs (16 hex chars) still accepted during migration via `KOI_A
 
 | Node | Node RID | Public Key (truncated) |
 |------|----------|----------------------|
-| **Octo** | `orn:koi-net.node:octo-salish-sea+50a3c9eac05c807f7f0ad114aad3b50b67bbbe1015664e39988f967f9ef4502b` | `MFkwEwYH...` |
+| **Octo** | `orn:koi-net.node:octo-salish-sea+f06551d75797303be1831a1e00b41cf930625961882082346cb3932175a17716` | `MFkwEwYH...` |
 | **FR** | `orn:koi-net.node:front-range+b5429ae7981decb0ddf5a45551b176846e6121f964543259eccf4a0a1a6ff21c` | `MFkwEwYH...` |
 | **GV** | `orn:koi-net.node:greater-victoria+81ec47d80f2314449b0f4342c087eb91dabf7811fc2d846233c389ef2b0b6f58` | `MFkwEwYH...` |
 
 > **RID migration complete (2026-02-18):** Node RIDs migrated from legacy16 (16-char) to b64_64 (64-char BlockScience canonical). Same keypairs, full SHA-256 hash suffix.
+> **Octo RID rotated (2026-02-26):** Previous RID (`...+50a3c9ea...`) superseded after key rotation. FR RID reconciliation done (234 cross-refs updated, old node record marked inactive).
 
 Octo's key: `/root/koi-state/octo-salish-sea_private_key.pem` (on 45.132.245.30).
 FR's key: `/root/koi-state/front-range_private_key.pem` (on 45.132.245.30).
@@ -54,7 +55,8 @@ GV's key: `/home/koi/koi-state/greater-victoria_private_key.pem` (on poly 37.27.
 │   │   ├── entity_schema.py         # 15 entity types, resolution config
 │   │   ├── vault_parser.py          # YAML→predicate mapping (27 predicates)
 │   │   ├── web_fetcher.py           # URL fetch + Playwright + content extraction
-│   │   ├── koi_net_router.py        # KOI-net protocol endpoints (8 endpoints)
+│   │   ├── koi_net_router.py        # KOI-net protocol + commons intake endpoints
+│   │   ├── commons_ingest_worker.py # Async background worker for commons intake
 │   │   ├── koi_envelope.py          # ECDSA P-256 signed envelopes
 │   │   ├── koi_poller.py            # Background federation poller
 │   │   ├── koi_protocol.py          # Wire format models (Pydantic)
@@ -65,18 +67,21 @@ GV's key: `/home/koi/koi-state/greater-victoria_private_key.pem` (on poly 37.27.
 │   │   └── personal.env             # Octo DB creds, OpenAI key, vault path
 │   ├── migrations/
 │   │   ├── 038_bkc_predicates.sql   # BKC ontology predicates
-│   │   ├── 039_koi_net_events.sql   # Event queue, edges, nodes tables
-│   │   ├── 039b_ontology_mappings.sql # Source schemas + ontology mappings
-│   │   ├── 040_entity_koi_rids.sql  # KOI RID column on entity_registry
-│   │   ├── 041_cross_references.sql # Federation cross-references
-│   │   └── 042_web_submissions.sql  # URL submission tracking
+│   │   ├── 039–052_*.sql            # Federation, shared docs, assertion history, etc.
+│   │   ├── 053_commons_decision_log.sql     # Decision audit log + expanded intake status
+│   │   ├── 054_commons_merge_candidates.sql # Merge candidate queue for entity resolution
+│   │   └── baselines/{octo,fr,gv}_koi.json # Migration manifests per node
 │   ├── scripts/
 │   │   └── backfill_koi_rids.py     # One-time RID backfill
 │   ├── tests/
 │   │   └── test_koi_interop.py      # KOI-net protocol interop tests
 │   ├── requirements.txt
 │   └── venv/                        # Python virtualenv
-├── fr-agent/                   # Front Range peer node (port 8355, localhost-only)
+├── fr-koi-processor/           # FR KOI code (deployed by deploy.sh, separate from Octo's koi-processor/)
+│   ├── api/                    #   Same code as koi-processor/api/ (vendored from canonical)
+│   ├── migrations/
+│   └── .version                # Stamped git SHA after each deploy
+├── fr-agent/                   # Front Range config/workspace/vault (port 8355, localhost-only)
 │   ├── config/
 │   │   └── fr.env
 │   ├── workspace/
@@ -353,11 +358,19 @@ Octo's databases are in the local PostgreSQL container (`regen-koi-postgres`). G
 - `koi_net_edges` — Node-to-node relationships (POLL/PUSH, rid_types filter)
 - `koi_net_nodes` — Peer registry with public keys
 - `koi_net_cross_refs` — Cross-references linking local entities to remote RIDs
+- `koi_shared_documents` — Inbound shared documents with intake status lifecycle
+- `koi_outbound_share_ledger` — Outbound share tracking
 
-### Schema infrastructure tables (octo_koi only)
+### Commons intake tables (per database, where `COMMONS_INGEST_ENABLED=true`)
 
-- `source_schemas` — Schema registry with consent tracking
-- `ontology_mappings` — Source→BKC field mappings
+- `koi_commons_decisions` — INSERT-only audit log of approve/reject decisions (migration 053)
+- `koi_commons_merge_candidates` — Queue of ambiguous entity matches for admin review (migration 054)
+
+### Schema infrastructure tables
+
+- `koi_migrations` — Migration governance registry (canonical migration_id + checksum + applied_at)
+- `source_schemas` — Schema registry with consent tracking (octo_koi only)
+- `ontology_mappings` — Source→BKC field mappings (octo_koi only)
 
 ## Backups
 
@@ -430,20 +443,26 @@ The source files in this repo map to server paths:
 
 ## Current Status
 
-**Date:** 2026-02-19
-**Status:** HEALTHY — 3-node cross-network federation active
+**Date:** 2026-02-26
+**Status:** HEALTHY — 3-node commons-capable federation active
 
 ### What's Done
 - Sprints 1-3 deployed: KOI-net federation working between Octo (coordinator) and GV (leaf)
 - **GV migrated to remote server** (2026-02-18): `37.27.48.12` (poly), port 8351, user `koi`, own PostgreSQL container (port 5433). Same keypair, RID preserved. 3-node topology: Octo + GV (remote) + CV (Shawn)
-- **Old GV decommissioned** (2026-02-19): Removed gv-koi-api service, gv_koi DB, /root/gv-agent/, and old private key from 45.132.245.30. Final backups: `/root/backups/gv_koi_final_20260219.sql.gz` + `gv_agent_final_20260219.tar.gz`
 - P0-P9 protocol alignment complete (98 tests, deployed), keys encrypted at rest (P9)
-- **Front Range agent deployed** (2026-02-19): `127.0.0.1:8355` on Octo server, `fr_koi` DB, bidirectional federation with Octo, localhost-only (peer through coordinator topology)
+- **Front Range agent deployed** (2026-02-19): `127.0.0.1:8355` on Octo server, `fr_koi` DB, bidirectional federation with Octo, localhost-only (peer through coordinator topology). Code path: `/root/fr-koi-processor/`
 - Node RID migration to b64_64 (BlockScience canonical) complete
 - 70 entities in Octo across 14 types, seeded via `seed-vault-entities.sh`
-- Cross-reference resolution verified: Herring Monitoring = `same_as` (confidence 1.0)
 - Cowichan Valley (Shawn's node) live at `202.61.242.194:8351`
-- **Phase 5.7: GitHub sensor activated** (2026-02-19): 4 repos (Octo, openclaw, koi-net, personal-koi-mcp), 35k+ code artifacts, tree-sitter Python/TS extraction, vault notes in `Sources/GitHub/`, 6-hour auto-scan interval
+- **Phase 5.7: GitHub sensor activated** (2026-02-19): 4 repos, 35k+ code artifacts, tree-sitter extraction, 6-hour auto-scan interval
+- **Commons intake workflow deployed** (2026-02-26, commit `1bb24b50`):
+  - Decision audit log (migration 053) + merge candidate queue (migration 054)
+  - Async ingest worker (`commons_ingest_worker.py`) on all 3 nodes (`COMMONS_INGEST_ENABLED=true`)
+  - Merge review endpoints, admin guard, transaction safety
+  - POST `/chat` RAG endpoint for web dashboard
+  - E2E verified: `staged → approved → ingesting → ingested`
+- **Octo RID rotated** (2026-02-26): New RID `...+f06551d7...`; FR RID reconciliation done (234 cross-refs updated)
+- **Web dashboard deployed** with commons merge review UI, chat, entity browser, knowledge panel
 
 ### GV Remote Node (poly)
 - **Host:** `37.27.48.12` (poly server, shared with AlgoTrading)
@@ -492,3 +511,6 @@ curl -s http://127.0.0.1:8354/health
 |------------|------|-------|----------|
 | `eca2a0ec` | 2026-02-08 | Holonic infra | Strategy docs, implementation plan, SSH setup, hyperlinks |
 | `7aead4bb` | 2026-02-08 | Cleanup sprint | Fix deployment bugs, seed 70 entities, event_id confirm flow, architecture update (CV + FR), GitHub sensor plan (Phase 5.7) |
+| `de8dd498` | 2026-02-25/26 | Convergence | KOI Runtime Convergence Plan: Phase 0 audit, Phase 0.5 contracts, Phase 1-2 implementation, Phase 3-5 scaffolding. |
+| `eaecf381` | 2026-02-26 | Accelerated Rollout | Early soak close; FR canary/e2e PASS; FR + Octo convergence deploys; GV deferred on `/health`. |
+| `45c44f93` | 2026-02-26 | Commons Intake Deploy | Full commons intake to all 3 nodes (migrations 053-054, async worker, merge review); GV `/health` resolved; Octo RID rotated; FR RID reconciliation; web dashboard deployed. |
